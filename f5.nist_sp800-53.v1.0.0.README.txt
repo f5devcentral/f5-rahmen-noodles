@@ -1,0 +1,41 @@
+Version: f5.nist_sp800_53.v1.0.0
+Last modified: February 2017
+iApp requires: BIG-IP version 11.5.3 - 12.1.2
+
+Introduction
+This F5 iApp for NIST SP-800-53r4 allows you to configure a BIG-IP device to support 
+security controls according to the U.S. National Institute of Standards and Technology 
+(NIST) Special Publication 800-53 (Revision 4): Security and Privacy Controls for Federal
+Information Systems and Organizations (updated 01-02-2015).
+
+NIST SP-800-53r4 is a complex document. Only some of the controls (that is, policies plus supporting 
+technical measures) that organizations adopt to comply with SP-800-53r4 relate to the BIG-IP 
+configuration. The associated deployment guide discusses the security controls in Appendix F 
+of NIST SP-800-53r4 most applicable to BIG-IP configuration and shows how to support them.
+
+
+Deployment Guide 
+F5 very strongly recommends reading the deployment guide before
+attempting to use this iApp template. The deployment guide with detailed instructions 
+and prerequisites is located at http://f5.com/pdf/deployment-guides/nist-sp-800-53-r4-dg.pdf
+
+
+Importing and Using the Template
+
+Extract the template file in a location accessible by the BIG-IP system. From
+the BIG-IP Configuration utility, on the Main tab, expand 'iApp' and then click
+'Templates'. Click 'Import' and then click the 'Browse' button to select the
+template file 'f5.nist_sp800_53.v1.0.0'. Click 'Upload' to
+install the template to your BIG-IP system.
+
+
+New Features and configuration changes:
+
+- All customer secrets/passwords in the iApp template are now securely stored.  Previously, although secrets were stored in Secure Vault for use, some may have been stored in cleartext in the iApp reconfiguration data. 
+- Added support for BIG-IP versions 12.1 - 12.1.2.
+- Made error messages produced by the template easier to understand.
+- If using RADIUS authentication, you are now limited a maximum of 10 servers.  Previously there was no limit.
+
+Issues resolved:
+
+- The source-IP option on additional syslog servers is honored in this version, previously this field was ignored. 

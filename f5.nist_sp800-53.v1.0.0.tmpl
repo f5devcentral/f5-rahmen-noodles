@@ -1,0 +1,4126 @@
+# Copyright 2016. F5 Networks, Inc. See End User License Agreement (EULA) for
+# license terms. Notwithstanding anything to the contrary in the EULA, Licensee
+# may copy and modify this software product for its internal business purposes.
+# Further, Licensee may upload, publish and distribute the modified version of
+# the software product on devcentral.f5.com.
+
+#TMSH-VERSION: 12.0.0
+
+cli script /Common/f5.iapp.1.5.2.scli {
+#  Initialization proc for all templates.
+#  Parameters "start" and "stop" or "end".
+proc iapp_template { action } {
+    switch $action {
+        start {
+            catch { tmsh::modify sys scriptd log-level debug }
+            set ::clock_clicks [clock clicks]
+            puts "\nStarting iApp $tmsh::app_template_name [clock format \
+                [clock seconds] -format {%m/%d/%Y %T}]\n"
+            tmsh::log info "Starting iApp template $tmsh::app_template_name"
+        }
+        stop -
+        end {
+            if { [info exists ::substa_debug] } {
+                puts $::substa_debug
+            }
+            puts "\nEnding iApp $tmsh::app_template_name [clock format \
+                [clock seconds] -format {%m/%d/%Y %T}]\nRun time [expr \
+                { ([clock clicks] - $::clock_clicks) / 1000 }] msec\n"
+            tmsh::log info "Ending iApp template $tmsh::app_template_name"
+        }
+    }
+    set ::HTTP_CONTENT_TYPES { application/(css\|css-stylesheet\|doc\|excel\|javascript\|json\|lotus123\|mdb\|mpp\|msaccess\|msexcel\|ms-excel\|mspowerpoint\|ms-powerpoint\|msproject\|msword\|ms-word\|photoshop\|postscript\|powerpoint\|ps\|psd\|quarkexpress\|rtf\|txt\|visio\|vnd\\.excel\|vnd\\.msaccess\|vnd\\.ms-access\|vnd\\.msexcel\|vnd\\.ms-excel\|vnd\\.mspowerpoint\|vnd\\.ms-powerpoint\|vnd\\.ms-pps\|vnd\\.ms-project\|vnd\\.msword\|vnd\\.ms-word\|vnd\\.ms-works\|vnd\\.ms-works-db\|vnd\\.powerpoint\|vnd\\.visio\|vnd\\.wap\\.cmlscriptc\|vnd\\.wap\\.wmlc\|vnd\\.wap\\.xhtml\\+xml\|vnd\\.word\|vsd\|winword\|wks\|word\|x-excel\|xhtml\\+xml\|x-java-jnlp-file\|x-javascript\|x-json\|x-lotus123\|xls\|x-mdb\|xml\|x-mscardfile\|x-msclip\|x-msexcel\|x-ms-excel\|x-mspowerpoint\|x-msproject\|x-ms-project\|x-msword\|x-msworks-db\|x-msworks-wps\|x-photoshop\|x-postscript\|x-powerpoint\|x-ps\|x-quark-express\|x-rtf\|x-vermeer-rpc\|x-visio\|x-vsd\|x-wks\|x-word\|x-xls\|x-xml) image/(photoshop\|psd\|x-photoshop\|x-vsd) text/(css\|html\|javascript\|json\|plain\|postscript\|richtext\|rtf\|vnd\\.wap\\.wml\|vnd\\.wap\\.wmlscript\|wap\|wml\|x-component\|xml\|x-vcalendar\|x-vcard) }
+}
+
+proc iapp_is { args } {
+    set up_var [lindex $args 0]
+    upvar $up_var var
+    if { [info exists var] } {
+        foreach val [lrange $args 1 end] {
+            if { [subst $var] eq $val } {
+                return 1
+            }
+        }
+    }
+    return 0
+}
+
+proc iapp_substa { args } {
+    upvar substa_in  argx \
+          substa_out rval
+    set   argx $args
+
+    # check the explicit value first.
+    # multiple layers of variable substitution requires multiple subst.
+    # error occurs here if any of the substituted variables do not exist
+    # valid wildcard (*) array entries will fail here first.
+    uplevel {
+        append ::substa_debug "\n$substa_in"
+        if { [info exists [set substa_in]] } {
+            set substa_out [subst $$substa_in]
+            set substa_out [subst $substa_out]
+        } else {
+            # since explicit value did not exist, try a wildcard value.
+            # substitute "*" as the array key and repeat.
+            set substa_tmp [split $substa_in "()"]
+            set substa_in "[lindex $substa_tmp 0](*)"
+            append ::substa_debug "*"
+            if { [info exists [set substa_in]] } {
+                set substa_out [subst $$substa_in]
+                set substa_out [subst $substa_out]
+            } else {
+                error "substa \"$substa_in\" array value not found"
+            }
+        }
+    }
+    return $rval
+}
+
+proc iapp_conf { args } {
+
+    # Return value $object_name is set to the first word in $arg that
+    # contains an underscore, since the position of the object name in
+    # tmsh syntax is not consistent.
+    set args [join $args]
+    set object_name [lindex $args [lsearch -glob $args "*_*"]]
+
+    # Global array ::tmsh_history persists between calls to iapp_conf
+    # in order to suppress duplicate commands.
+    if { ![info exists ::tmsh_history($args)] } {
+        set ::tmsh_history($args) 1
+        iapp_debug $args
+        switch -exact -- [string range $args 0 5] {
+            create { tmsh::create [string range $args 7 end] }
+            modify { tmsh::modify [string range $args 7 end] }
+            delete { tmsh::delete [string range $args 7 end] }
+            default { error "iapp_conf illegal parameter" }
+        }
+    }
+    return $object_name
+}
+
+proc iapp_make_safe_password { password } {
+    return [string map { \' \\\' \" \\\" \{ \\\{ \} \\\} \; \\\; \| \\\| \# \\\# \  \\\  \\ \\\\ } $password]
+}
+
+proc iapp_pull { loc items_list } {
+    upvar $items_list items
+    if { [set item [lindex $items $loc]] != "" } {
+        set items [lreplace $items $loc $loc]
+    }
+    return $item
+}
+
+proc iapp_process_flags { flags_array args_list } {
+    upvar $flags_array flags
+    upvar $args_list args
+
+    if { [set dubdash [lsearch $args "--"]] != -1 } {
+        set args [lreplace $args $dubdash $dubdash];
+    } else {
+        set dubdash end
+    }
+
+    foreach flag [array names flags] {
+        while { [set ptr [lsearch [lrange $args 0 $dubdash] $flag]] != -1 } {
+            set args [lreplace $args $ptr $ptr];
+
+            # we want to run the code in the flags_array at the calling
+            # proc's level so that the variables that it sets up are
+            # available there.
+            set access_var [format "$%s(%s)" $flags_array $flag]
+            set command [subst -nocommands { set ptr $ptr ; subst $access_var }]
+
+            uplevel 1 $command
+        }
+    }
+    return $args
+}
+
+proc iapp_tmos_version { args } {
+    set cversion [tmsh::version]
+    if { $cversion eq "" } {
+        tmsh::log err "unable to determine TMOS version"
+        error "unable to determine TMOS version"
+    }
+
+    # if no op+version was specified, just return the version
+    if { $args eq "" } { return $cversion }
+    if { [llength $args] > 2 } {
+        error "Too many arguments"
+    }
+
+    set op [lindex $args 0]; # operator
+    set NOTFOUND -1
+    # constrain to valid operators - adding more is fine as long as
+    # they are supported by [expr] (and makes sense)
+    if { [lsearch -exact { < > <= >= == != } $op] == $NOTFOUND } {
+        tmsh::log err "illegal operator: $op"
+        error "illegal operator: $op"
+    }
+
+    set tversion [lindex $args 1]; # target version
+    # one or two decimal digits, optionally followed by 0-2 complete groups of
+    # dots followed by one or two decimal digits with nothing before or after
+    set regex {^\d{1,2}(\.\d{1,2}){0,2}$}
+    if { ! [regexp -- $regex $tversion] } {
+        tmsh::log err "cannot parse version from: $tversion"
+        error "cannot parse version from: $tversion"
+    }
+
+    # p=>prefix, c=>current, t=>target
+    foreach p { c t } {
+        # extract major/minor/point components
+        scan [set [set p]version] "%d.%d.%d" [set p]mjr [set p]mnr [set p]pnt
+        # ensure that these are each set to at least 0
+        foreach level { mjr mnr pnt } {
+            if { ! [info exists [set p]${level}] } { set [set p]${level} 0 }
+        }
+        # turn them into one big number that we can compare
+        # leave room in-between just to be safe
+        set [set p]num [expr {
+            [set [set p]mjr]*1000000 +
+            [set [set p]mnr]*10000 +
+            [set [set p]pnt]*100
+        }]
+    }
+    # a simple numeric comparison is all that is needed at this point
+    return [eval expr $cnum $op $tnum ]
+}
+
+proc iapp_safe_display { args } {
+    # strings sent to APL must be truncated to 65535 bytes, see BZ435592
+    if { [string length [set [set args]]] > 65535 } {
+        set last_newline [string last "\n" [set [set args]] 65500]
+        return "[string range [set [set args]] 0 $last_newline]Error: Too many items for display"
+    } else {
+        return [set [set args]]
+    }
+}
+
+proc iapp_get_items { args } {
+
+    # Set default values.
+    set error_msg  "iapp_get_items $args:"
+    set do_binary  0
+    set nocomplain 0
+    set items      ""
+    set join_char  "\n"
+    set recursive  "recursive"
+    set com_dir    "/Common"
+    set loc_dir    "[tmsh::pwd]"
+
+    # Set up flag-related work.
+    array set flags  {
+        -exists      { [set do_binary 1] }
+        -nocomplain  { [set nocomplain 1] }
+        -list        { [set join_char " "] }
+        -norecursive { [set recursive ""] }
+        -local       { [set com_dir   ""] }
+        -dir         { [set loc_dir      [iapp_pull $ptr args]] }
+        -filter      { [set filter_field [iapp_pull $ptr args]] \
+                       [set filter_op    [iapp_pull $ptr args]] \
+                       [set filter_value [iapp_pull $ptr args]] }
+    }
+    iapp_process_flags flags args
+
+    # Get system object names in all requested directories.
+    set save_dir [tmsh::pwd]
+    foreach dir [lsort -unique "$com_dir $loc_dir"] {
+        tmsh::cd $dir
+        set tmsh_rval [catch {
+            foreach obj [tmsh::get_config $args $recursive] {
+
+                if { [info exists filter_field] } {
+                    if { $filter_field eq "NAME" } {
+                        set val [tmsh::get_name $obj]
+                    } else {
+                        # If get_field_value throws error, assume "none" value
+                        if { [catch {
+                            set val [tmsh::get_field_value $obj $filter_field]
+                            # strip quotes per BZ442531
+                            set val [string map {\" ""} $val]
+                        }]} { set val none }
+                    }
+                    # Non-Tcl operators =~ and !~ added for extra flexibility
+                    if { $filter_op eq "=~" } {
+                        set filter "\[regexp \"$filter_value\" \"$val\"\]"
+                    } elseif { $filter_op eq "!~" } {
+                        set filter "!\[regexp \"$filter_value\" \"$val\"\]"
+                    } else {
+                        set filter "\\\"$val\\\" $filter_op \\\"$filter_value\\\""
+                    }
+                    # If filter fails, skip to next object
+                    if { ![eval expr $filter] } {
+                        continue
+                    }
+                }
+                # string map catches /Common added by ltm profile ntlm,
+                # which is unlike all other ltm profile return values.
+                lappend items $dir/[string map {/Common/ ""} [tmsh::get_name $obj]]
+            }
+        } err ]
+    }
+    tmsh::cd $save_dir
+
+    # array keys: $do_binary,$tmsh_rval,$nocomplain. Do not insert whitespace.
+    array set rval {
+        0,0,0 {[join $items $join_char]}
+        0,0,1 {[join $items $join_char]}
+        0,1,0 {[error "$error_msg $err"]}
+        0,1,1 {}
+        1,0,0 {[llength $items]}
+        1,0,1 {[llength $items]}
+        1,1,0 {0}
+        1,1,1 {0}
+    }
+
+    return [subst $rval($do_binary,$tmsh_rval,$nocomplain)]
+}
+
+proc iapp_get_provisioned { args } {
+
+    array set lnum {
+        none      0
+        minimum   1
+        nominal   2
+        dedicated 3
+    }
+
+    # Set defaults.
+    set required minimum
+    set do_binary 1
+
+    # Set up flag-related work.
+    array set flags  {
+        -is          { [set required [iapp_pull $ptr args]] }
+        -level       { [set do_binary 0] }
+    }
+    iapp_process_flags flags args
+    if { [llength $args] > 1 } {
+        error "Too many arguments"
+    }
+
+    # If checking for AM provisioning on TMOS < 11.4,
+    # check for WAM provisioning instead.
+    if { $args eq "am" && [iapp_tmos_version < 11.4] } {
+        set args "wam"
+    }
+
+    # Get the provisioning level. If blank, assume none.
+    # Proc only checks 1 module at a time, so only 1 object is returned.
+    if { [catch {
+        set obj [tmsh::get_config sys provision $args]
+        set level [tmsh::get_field_value [lindex $obj 0] level]
+    }]} { set level none }
+
+    if { $do_binary } {
+        return [expr { $lnum($level) >= $lnum($required) }]
+    } else {
+        return $level
+    }
+}
+
+proc iapp_get_user { args } {
+
+    # Set defaults.
+    set do_role 0
+    set do_binary 0
+
+    # Set up flag-related work.
+    array set flags  {
+        -is_admin    { [set do_binary 1] }
+    }
+    iapp_process_flags flags args
+    if { [llength $args] > 1 } {
+        error "Too many arguments"
+    }
+
+    # Show user auth was introduced in v11.6
+    set user "unknown"
+    catch {
+        set user [tmsh::show auth user field-fmt]
+    } err
+    if { $do_binary } {
+        return [expr { $user == "unknown"
+        || [string first "role " $user] == -1
+        || [string first "role admin" $user] != -1
+        || [string first "role resource-admin" $user] != -1 }]
+    } else {
+        return $user
+    }
+}
+
+proc iapp_destination { args } {
+    # Set defaults. Flag actions may overwrite defaults later.
+    set route_domain    0
+    set do_mask         0
+    set port            0
+
+    # Set up flag-based actions.
+    array set flags  {
+        -route_domain { [set route_domain [iapp_pull $ptr args]] }
+        -mask         { [set do_mask 1] }
+        -length       { [set cidr_bits [iapp_pull $ptr args]] }
+    }
+
+    if { [llength [set non_switches [iapp_process_flags flags args]]] > 2 } {
+        error "Too many arguments"
+    }
+    if { [llength $non_switches] == 2 } { set port [lindex $non_switches 1] }
+    set addr [lindex $non_switches 0]
+
+
+    # Detect a CIDR mask and pull it off the addr string
+    if { [set loc [string first "/" $addr end-4]] != -1 } {
+        set cidr_bits [string range $addr [expr {$loc + 1}] end]
+        set addr [string range $addr 0 [expr {$loc - 1}]]
+    }
+
+    # Pull the route-domain off the addr string, but only use it as the
+    # route domain if it wasn't overridden by -route_domain flag.
+    if { [string first "%" $addr] != -1 } {
+        if { $route_domain == 0 } {
+            # route-domain is still default, so use value from addr string
+            set route_domain [lindex [split $addr "%"] 1]
+        }
+        set addr [lindex [split $addr "%"] 0]
+    }
+
+    if { $do_mask } {
+
+        # Define the delta between ipv4 and ipv6.
+        # length: ipv4 mask is 32 bits, ipv6 is 128 bits.
+        # group: ipv4 is grouped in octets, ipv6 as 16 bit words.
+        # format: ipv4 is decimal notation, ipv6 is hex.
+        # format1 also has the delimiter, format2 does not.
+        array set v {
+            0,length  32
+            0,group   8
+            0,format1 d.
+            0,format2 d
+            1,length  128
+            1,group   16
+            1,format1 .4x:
+            1,format2 .4x
+        }
+        set is_ipv6 [string match "*:*:*" $addr]
+
+        # Soften result of an illegal -length parameter.
+        if { ![info exists cidr_bits] || $cidr_bits > $v($is_ipv6,length) } {
+            set cidr_bits $v($is_ipv6,length)
+        } elseif { $cidr_bits < 0 } {
+            set cidr_bits 0
+        }
+
+        # Loop on the full length of the mask: 32 bits for ipv4, 128 for ipv6
+        for { set octet 0; set i 0 } { $i < $v($is_ipv6,length) } { incr i } {
+
+           # Take a break at intervals to save the grouping and add delimiter.
+           # Interval is 8 bits for ipv4 and 16 bits for ipv6.
+           if { $i && ![expr {$i % $v($is_ipv6,group)}] } {
+
+               # Add the grouping and delimiter to the mask, then reset.
+               append mask [format %$v($is_ipv6,format1) $octet]
+               set octet 0
+           }
+           # Shift the prior bits left by multiplying by 2.
+           # Then add the current bit, which is 1 if part of the mask, 0 if not.
+           # Current bit is part of the mask if $i < number of bits in the mask.
+           set octet [expr { 2 * $octet + ($i < $cidr_bits) }]
+        }
+        # Add the final grouping, then return the finished mask.
+        set ret_val [format $mask%$v($is_ipv6,format2) $octet]
+
+    } else {
+
+        # calculate a destination
+        # the route domain might be a name and we need a number.
+        if { ![string is integer $route_domain] } {
+            set route_domains [tmsh::get_config "/ net route-domain $route_domain"]
+            if { [llength $route_domains] != 1 } {
+                error "no such route domain: $route_domain"
+            }
+            # since we have already determined that the list is 1 long,
+            # this explicit reference to element 0 is safe
+            set route_domain [tmsh::get_field_value [lindex $route_domains 0] "id"]
+        }
+
+        set route_domain [expr { $route_domain == 0 ? "" : "%$route_domain" }]
+
+        # 0 and * represent wildcard port assignments in the GUI,
+        # but TMSH requires the string 'any' to specify a wildcard.
+        if { $port == 0 || $port == "*" } {
+            set port any
+        }
+
+        # Build the final destination. Use ":" for node names even if ipv6.
+        set is_ipv6_literal [string match "*:*:*" $addr]
+        set addr_delimiter  [expr { $is_ipv6_literal ? "." : ":" }]
+        set ret_val ${addr}${route_domain}${addr_delimiter}${port}
+    }
+    return $ret_val
+}
+
+proc iapp_pool_members { args } {
+
+    # Set defaults.
+    array set fields {
+        address          addr
+        port             port
+        port-secure      port_secure
+        connection-limit connection_limit
+        priority-group   priority
+        ratio            ratio
+    }
+    set route_domain ""
+    set port_override -1
+    set aaa_domain 0
+    set aaa_priority -1
+    set app_service ""
+    # Set up flag-related work.
+    array set flags {
+        -fields       { [array set fields  [iapp_pull $ptr args]] }
+        -route_domain { [set route_domain  [iapp_pull $ptr args]] }
+        -port         { [set port_override [iapp_pull $ptr args]] }
+        -aaa_domain   { [set aaa_domain    1] }
+        -aaa_pool     { [set aaa_priority  0] }
+        -noapp        { [set app_service " app-service none"] }
+    }
+    iapp_process_flags flags args
+
+    # Identify the non-address/non-port fields. These go inside braces in tmsh.
+    set nonport_fields [lsearch -all -not -inline -regexp \
+        [array names fields] {address|port|port-secure}]
+
+    set members ""
+    foreach row [join $args] {
+
+        # Skip invalid table rows.
+        if { [llength [join $row]] %2 == 1 } {
+            continue
+        }
+
+        # Import APL table into an array for processing.
+        array unset columns
+        array set columns [join $row]
+        set addr $columns($fields(address))
+
+        # Identify the port number, either from table columns or by -port flag.
+        if { $port_override != -1 } {
+            set port $port_override
+        } elseif { [info exists columns($fields(port))] } {
+            set port $columns($fields(port))
+        } elseif { [info exists columns($fields(port-secure))] } {
+            set port $columns($fields(port-secure))
+        } else {
+            set port 80
+        }
+
+        # If specified, strip entered route domain and append the flag value.
+        if { $route_domain != "" } {
+            set addr [lindex [split $addr "%"] 0]
+            set addr "$addr%$route_domain"
+        }
+
+        # If -aaa_domain, use domain controller format, otherwise use pool format
+        if { $aaa_domain } {
+            append members " $columns($fields(host)) \{ ip $addr $app_service \}"
+        } else {
+            append members " [iapp_destination $addr $port] \{"
+
+            # Transfer non-port fields from the table to the tmsh string.
+            foreach name $nonport_fields {
+                if { [info exists columns($fields($name))] } {
+                    append members " $name $columns($fields($name))"
+                }
+            }
+
+            # If -aaa_pool, add priority field with incrementing value.
+            # This is required by APM.
+            if { $aaa_priority >= 0 } {
+                append members " priority-group [incr aaa_priority]$app_service"
+            }
+            append members " \}"
+        }
+    }
+
+    return "[expr { $aaa_domain ? "" : "members " }][expr { $members eq "" \
+        ? "none" : "replace-all-with \{ $members \}" }]"
+}
+
+proc iapp_debug { args } {
+
+    # Passwords should be obscured in all logs. Fields shown here are handled
+    # in this proc, but the global variable may be overwritten if alternate
+    # fields should be obscured.
+    if { ![info exists ::SENSITIVES] } {
+        set ::SENSITIVES {
+            account-password
+            admin-encrypted-password
+            bind-pw
+            PASSWORD
+            password
+            passwd
+            proxy-ca-passphrase
+            secret
+        }
+    }
+
+    # look for any of the sensitive words, and replace the word that follows it
+    set regex "(\\m([join $::SENSITIVES |])\\M)\\s+\[^\\s\]*"
+    regsub -all $regex [join $args] {\1 -OBSCURED-} args
+    regsub -all "(<Password.*>).*(</Password>)" $args {\1-OBSCURED-\2} args
+
+    set lev [tmsh::get_field_value [lindex [tmsh::get_config sys scriptd \
+        log-level] 0] log-level]
+    if { $lev eq {debug} } {
+        puts $args
+    }
+}
+
+# The apm_config proc provides a tmsh pre-processor for APM
+# configuration, which in most cases will drastically reduce
+# implementation code. To configure APM with this proc, pass
+# it an array of object names and associated meta-tag substitutions.
+# Each object must be categorized as a profile, a resource, or
+# a policy-item. APM agents and customization-groups are derived
+# from these 3 categories as needed.
+#
+# apm_config's return value is a list of the APM profiles defined
+# in the argument and instantiated by the proc. This allows the
+# procedure call to be embedded directly into a virtual server
+# definition.
+#
+# These universal meta-tags may be placed anywhere in the array:
+# <ITEM> The object name, eg. apm_access
+# <PREFIX> The app name, including folder, eg. /Common/my_app.app/my_app
+#
+# Profile objects require the following meta-tags:
+# <PROFILE_TYPE> The tmsh object type, eg. "apm profile access"
+# <PROFILE_DEF>  The body of the object, eg.:
+#     "access-policy <PREFIX>
+#      defaults-from /Common/access
+#      eps-group <PREFIX>_eps
+#      errormap-group <PREFIX>_errormap
+#      general-ui-group <PREFIX>_general_ui"
+#
+# apm_config will automatically create default customization-groups
+# for the "-group" lines specified in access profile definitions.
+# In the above example, there is no need to additionally specify a
+# customization-group for errormap and general-ui.
+#
+# <PROFILE_TYPE> is a catch-all for other APM types, eg:
+#      apm_sso {
+#          <PROFILE_TYPE> {apm sso kerberos}
+#          <PROFILE_DEF>  "account-name <USER>
+#                          account-password <PASS>
+#                          realm <REALM>" }
+#
+# In the example above, <PROFILE_TYPE> and <PROFILE_DEF> are
+# apm_config meta-tags, while <USER>, <PASS>, and <REALM> must
+# be substituted before calling apm_config, eg. if these tags are
+# defined in $pre_proc_map, they may be substituted with:
+# array set apm_map [string map [subst $pre_proc_map] [array get apm_map]]
+#
+# Resource objects require the following meta-tags:
+# <RESOURCE_TYPE> The apm resource object type, eg. "webtop"
+# <RESOURCE_DEF>  The body of the object, eg.:
+#     "customization-group <ITEM>
+#      minimize-to-tray false
+#      webtop-type full"
+#
+# In the above example, a customization-group is specified. Any
+# customization-group is assumed to be blank unless further defined by the
+# <GROUP_DEF> meta-tag, eg. <GROUP_DEF> {type webtop}
+#
+# Policy-item objects are defined by the following meta-tags:
+# <AGENT_TYPE>   default "resource-assign"
+# <AGENT_DEF>    default "customization-group <ITEM>"
+# <ITEM_AGENT>   default "agents { <ITEM>_ag { type <AGENT_TYPE> }}"
+# <ITEM_CAPTION> default "<ITEM>"
+# <ITEM_COLOR>   default "1"
+# <ITEM_TYPE>    default "action"
+# <ITEM_RULES>   defaults to a set of expressions/next-items where specified
+# <RULE_CAPTION_0> default "fallback"
+# <RULE_CAPTION_1> default "Successful"
+# <RULE_CAPTION_2> default "successful"
+#
+# apm_config generates the APM agent and customization-group definitions
+# as required for each policy-item, but specific objects may be defined
+# by using the <AGENT_DEF> and <GROUP_DEF> meta-tags.
+# To suppress the formation of an APM agent, specify <ITEM_AGENT> {}.
+
+proc iapp_apm_config { args } {
+
+    set app_service ""
+    array set flags  {
+        -noapp       { [set app_service "app-service none\n   "] }
+    }
+    iapp_process_flags flags args
+
+    upvar [lindex $args 0] map_array
+
+    # Pull $prefix from the array
+    set prefix $map_array(prefix)
+    unset map_array(prefix)
+
+    # Stencils for creating apm objects
+    set access_form \
+       "<TMSH_CREATE> apm policy access-policy <ITEM> {\n   \
+          $app_service    caption general\n   \
+          start-item <ACCESS_START_ITEM>\n   \
+          default-ending <ACCESS_ENDING>\n   \
+          items replace-all-with {\n<ACCESS_ITEMS>    }\n}"
+
+    set profile_form "<TMSH_CREATE> <PROFILE_TYPE> <ITEM> {\n   \
+        $app_service    <PROFILE_DEF>\n}"
+
+    set resource_form "<TMSH_CREATE> apm resource <RESOURCE_TYPE> <ITEM> {\n   \
+        $app_service    <RESOURCE_DEF>\n}"
+
+    set agent_form "<TMSH_CREATE> apm policy agent <AGENT_TYPE> <ITEM>_ag {\n   \
+        $app_service    <AGENT_DEF>\n}"
+
+    set group_form "<TMSH_CREATE> apm policy customization-group <ITEM> {\
+        $app_service    <GROUP_DEF>}"
+
+    set agent_group_form "<TMSH_CREATE> apm policy customization-group <ITEM>_ag {\
+        $app_service    <GROUP_DEF>}"
+
+    set policy_item_form "<TMSH_CREATE> apm policy policy-item <ITEM> {
+    $app_service    <ITEM_AGENT>caption <ITEM_CAPTION>
+    color <ITEM_COLOR>
+    <ITEM_TYPE>
+    <ITEM_RULES>\n}"
+
+    # 1st round apm string map
+    set default_map_1 {
+        <ACCESS_ITEM> {}
+        <AGENT_DEF> "customization-group <ITEM>_ag"
+        <ITEM_AGENT> "agents replace-all-with {
+        <ITEM>_ag { type <AGENT_TYPE> }}\n    "
+        <ITEM_CAPTION> <ITEM>
+        <ITEM_COLOR> {1}
+        <ITEM_TYPE> "item-type action"
+        <ITEM_RULES> "rules
+        {[expr {[string first <RULE_NEXT_2> $map_array($item)] != -1 ? "{
+            caption <RULE_CAPTION_2>
+            expression <RULE_EXPR_2>
+            next-item ${prefix}_<RULE_NEXT_2>
+        }":""}][expr {[string first <RULE_NEXT_1> $map_array($item)] != -1 ? "{
+            caption <RULE_CAPTION_1>
+            expression <RULE_EXPR_1>
+            next-item ${prefix}_<RULE_NEXT_1>
+        }":""}]{
+            caption <RULE_CAPTION_0>
+            next-item ${prefix}_<RULE_NEXT_0>
+        }}"
+    }
+
+    # 2nd round apm string map
+    set default_map_2 {
+        <ITEM> [expr { $item eq {default} ? "$prefix" : "${prefix}_$item" }]
+        <PREFIX> $prefix
+        <LOCAL_PATH> [string map {/ :} $prefix]
+        <GROUP_DEF> ""
+        <AGENT_TYPE> "resource-assign"
+        <RULE_CAPTION_2> "successful"
+        <RULE_CAPTION_1> "Successful"
+        <RULE_CAPTION_0> "fallback"
+    }
+
+    # Build APM access profile and access-policy from the access_form.
+    # Tags <ACCESS_ITEM> and <ACCESS_ENDING> are picked up from
+    # $map_array items. <ITEM> and <GROUP_DEF> are picked up from
+    # $default_map_2.
+    foreach item [lsort [array names map_array]] {
+
+        # Pick up the <ACCESS_ENDING> tag. There should be just 1.
+        set access_form [string map $map_array($item) $access_form]
+
+        # Filter out items that do not belong in the access-policy.
+        # Anything with an ITEM_xxx tag belongs
+        if { [string first <ITEM_ $map_array($item)] == -1 } {
+            continue
+        }
+
+        # Add to the items list for the access-policy, e.g. priority
+        append access_items "        ${prefix}_$item {<ACCESS_ITEM>}\n"
+        set access_items [string map $map_array($item) $access_items]
+        set access_items [string map [subst $default_map_1] $access_items]
+    }
+
+    # Build APM resources, policy-items, agents, and customization-groups from
+    # the policy_item_form and resource_form.
+    foreach item [lsort [array names map_array]] {
+
+        # Each item starts as a profile, a resource, or a policy-item.
+        # Profiles are free-form, so other apm objects can use the profile form.
+        # In most cases, a policy-item spawns an agent.
+        # Any definition specifying a customization-group will spawn that group.
+        if { [string first "<PROFILE_DEF>" $map_array($item)] != -1 } {
+
+            # Collect profile names for attachment to the virtual server
+            if { [string first "apm profile " $map_array($item)] != -1 } {
+                lappend profiles [expr { $item eq {default}
+                                 ? "$prefix" : "${prefix}_$item" }]
+                # When an access profile is found, built a policy of the same name
+                if { [string first "apm profile access" $map_array($item)] != -1 } {
+                    set def [string map "<ACCESS_ITEMS> {$access_items}" $access_form]
+                    append cmds "[string map [subst $default_map_2] $def]\n"
+                }
+            }
+            set def $profile_form
+        } elseif { [string first "<RESOURCE_DEF>" $map_array($item)] != -1 } {
+            set def $resource_form
+        } else {
+            set def $policy_item_form
+            if { [string first "<ITEM_AGENT> {}" $map_array($item)] == -1 } {
+                append def $agent_form
+            }
+        }
+
+        # Apply 1st pass of string maps
+        set def [string map $map_array($item) $def]
+        set def [string map [subst $default_map_1] $def]
+
+        # If a customization-group is specified, add its definition
+        if { [string first "customization-group" $def] != -1 } {
+            if { [string first "apm policy agent" $def] != -1 } {
+                append def $agent_group_form
+            } elseif { [string first "apm profile access" $def] == -1 } {
+                append def $group_form
+            }
+        }
+
+        # Apply 2nd pass of string maps
+        set def [string map $map_array($item) $def]
+        append cmds [string map [subst $default_map_2] $def]
+    }
+
+    # Divide and execute tmsh commands
+    set tag "<TMSH_CREATE>"
+    set tag_length [string length $tag]
+    set last [expr { [string first $tag $cmds] + $tag_length }]
+    while { [set pos [string first $tag $cmds $last]] != -1 } {
+        incr pos -1
+        iapp_conf create [string range $cmds $last $pos]
+        set last [expr { $pos + $tag_length + 1 }]
+    }
+    iapp_conf create [string range $cmds $last end]
+    return $profiles
+}
+
+proc iapp_upgrade_template { upgrade_var upgrade_trans } {
+    upvar $upgrade_var   upgrade_var_arr
+    upvar $upgrade_trans upgrade_trans_arr
+
+    # create the new variables from the old
+    foreach { var } [array names upgrade_var_arr] {
+
+        # substitute old variable name for abbreviation "##"
+        regsub -all {##} $upgrade_var_arr($var) \$$var map_cmd
+
+        # run the mapping command from inside the array
+        if { [catch { subst $map_cmd } err] } {
+            if { [string first "no such variable" $err] == -1 } {
+                puts "ERROR $err"
+            }
+        }
+    }
+
+    # move variables over and apply translations
+    set var_mods ""
+    set var_adds ""
+    foreach var [array names vx] {
+
+        # if the APL variable name is in the translation array,
+        # then use the custom translation built for that variable.
+        if { [info exists upgrade_trans_arr($var)] } {
+            array set sub_arr [subst $upgrade_trans_arr($var)]
+            if { [info exists sub_arr($vx($var))] } {
+                set vx($var) $sub_arr($vx($var))
+            }
+            array unset sub_arr
+        # else, if the APL variable value is in the translation array,
+        # then use the generic translation of that value.
+        } elseif { [info exists upgrade_trans_arr($vx($var))] } {
+            set vx($var) [subst $upgrade_trans_arr($vx($var))]
+        }
+
+        # add to tmsh command string
+        if { [info exists ::$var] } {
+            append var_mods "\n $var \{ value \"$vx($var)\" \} "
+        } else {
+            append var_adds "\n $var \{ value \"$vx($var)\" \} "
+        }
+    }
+
+    # move tables over
+    set tbl_mods ""
+    set tbl_adds ""
+    foreach tbl [array names tx] {
+
+        # convert table from APL format to TMSH format
+        if { ![llength $tx($tbl)] } {
+            set tbl_def "column-names none"
+        } else {
+            set rows_def ""
+            foreach apl_row $tx($tbl) {
+                array set row_arr [join $apl_row]
+                append rows_def "\n  \{ row \{ "
+                foreach apl_col [array names row_arr] {
+                    append rows_def "$row_arr($apl_col) "
+                }
+                append rows_def "\}\}"
+            }
+            set tbl_def \
+            "\n  column-names \{ [array names row_arr] \} rows \{ $rows_def \}"
+            array unset row_arr
+        }
+
+        # add to tmsh command string
+        if { [info exists ::$tbl] } {
+            append tbl_mods "\n $tbl \{ $tbl_def \} "
+        } else {
+            append tbl_adds "\n $tbl \{ $tbl_def \} "
+        }
+    }
+
+    # construct the "tmsh modify" command
+    set cmd "sys application service $tmsh::app_name "
+    if { [llength $var_mods] } {
+        append cmd "\nvariables modify { $var_mods }"
+    }
+    if { [llength $var_adds] } {
+        append cmd "\nvariables add { $var_adds }"
+    }
+    if { [llength $tbl_mods] } {
+        append cmd "\ntables modify { $tbl_mods }"
+    }
+    if { [llength $tbl_adds] } {
+        append cmd "\ntables add { $tbl_adds }"
+    }
+
+    # Execute with debug output. This conversion takes place within the
+    # existing ASO, so tmsh modify is used instead of tmsh create.
+    iapp_debug "TEMPLATE UPGRADE"
+    iapp_conf modify $cmd
+    return
+}
+
+proc iapp_downgrade_template { pivot_var upgrade_var downgrade_table } {
+    upvar $downgrade_table downgrade_tbl_arr
+
+    # The ASO variable "offload_history" is used to recover the legacy
+    # choice a user made about SSL offload. It should be present in all cases.
+    # This conditional only handles the case where a user has deliberately
+    # deleted it by manipulating the ASO directly from tmsh.
+    if { ![info exists ::offload_history] } {
+        set ::offload_history "No"
+    }
+
+    # BIG-IP erases table contents when the APL optional hides the table.
+    # Since the prior data is not available, this downgrade must back-convert
+    # existing table data. Unlike tables, variables remain intact from the
+    # legacy ASO.
+    set tbl_def ""
+    foreach tbl [array names downgrade_tbl_arr] {
+        # Check for existence of each table in the current context.
+        # If not, skip to next.
+        if { ![info exists [set tbl]] } {
+            continue
+        }
+        # Check for existence of each table in the legacy context.
+        # If not, add an empty table so "tmsh tables modify" does not fail.
+        if { ![info exists ::$downgrade_tbl_arr($tbl)] } {
+            iapp_conf modify sys app ser $tmsh::app_name tables add \{ $downgrade_tbl_arr($tbl) \}
+        }
+        append tbl_def "$downgrade_tbl_arr($tbl) \{ "
+        if { [llength [subst $$tbl]] } {
+            set rows_def ""
+            foreach apl_row [subst $$tbl] {
+                array set row_arr [join $apl_row]
+                append rows_def "\n  \{ row \{ "
+                foreach apl_col [array names row_arr] {
+                    append rows_def "$row_arr($apl_col) "
+                }
+                append rows_def "\}\}"
+            }
+            append tbl_def \
+            "column-names \{ [array names row_arr] \} rows \{ $rows_def \}"
+            array unset row_arr
+        } else {
+            append tbl_def "rows none"
+        }
+        append tbl_def " \} "
+    }
+    regsub -all "\n" $tbl_def {} tbl_def
+    set cmd "sys app ser $tmsh::app_name \
+        variables modify \{ \
+            $pivot_var \{ value $::offload_history \} \
+            $upgrade_var \{ value No \} \
+        \} \
+        tables modify \{ $tbl_def \}"
+    iapp_debug "TEMPLATE DOWNGRADE"
+    iapp_conf modify $cmd
+    return
+}
+
+proc iapp_get_ca_certs { args } {
+    # Procedure formats and returns ca-bundle 509 certificates from ca-bundle.bak
+    # (copy of tmos supplied ca-bundle.crt)
+    # Returns backup files when using -files flag
+    # Returns specified restore file certificates when using -restore -return flags
+    # Returns specified restore file table certificates when using -restore -tablename
+    # Returns selected certificates
+    #
+    # Set defaults. Flag actions may overwrite defaults later.
+    set rest_files         0
+    set do_restore         0
+    set restore_return     0
+    set restore_table_name 0
+    set do_certs 0
+    set user_get [iapp_get_user]
+    set username [string range $user_get [expr {[string last user $user_get] +5 }] end-3 ]
+    # Set up flag-based actions.
+    array set flags  {
+        -files     { [set rest_files 1] }
+        -return    { [set do_restore 1] [set restore_return 1] }
+        -tablename { [set do_restore 1] [set restore_table_name 1] }
+        -certs     { [set do_certs 1] }
+    }
+    iapp_process_flags flags args
+    set fn_ca_bundle "[lindex $args 0]"
+    set cert_choices "[lindex $args 1]"
+    set duplicate " "
+    if { $rest_files eq 0 || $do_restore } {
+        set fh_ca_bundle [open $fn_ca_bundle r]
+        set ca_bundle_data [read $fh_ca_bundle]
+        close $fh_ca_bundle
+        set ca_bundle_split [split [string map "{-----END CERTIFICATE-----} \001" $ca_bundle_data] "\001"]
+        set final ""
+        # Grab Subject Name and Serial number from each certificate
+        foreach subject $ca_bundle_split {
+            if {$subject eq {}} {
+                continue
+            }
+            set a [string first Subject: $subject]
+            set b [string first \n $subject $a]
+            set ab [string range $subject $a $b]
+            set c [expr {[string first O= $ab] +2}]
+            if { $c < 2 }{
+                set c [expr {[string first CN= $ab] +2}]
+            }
+            set d [expr {[string first , $ab $c] -1}]
+            # Deal with case were comma is not present after subject name
+            if { $d < 0 }{
+                set dc [string range $ab $c end-1]
+            # Deal with case were text is not able to be located using common name, just grab the first 30 characters
+            } elseif { $d > 2000 }{
+                set dc [string range $ab $c 47]
+            } else {
+                set dc [string range $ab $c $d]
+            }
+            set f [expr {[string first Number: $subject] +7}]
+            set g [expr {[string first Signature $subject $f] -1}]
+            set fg [string range $subject $f $g]
+            # Remove spaces and new line characters from serial number
+            set fg_nospace [string map {" " "" "\n" "" ":" ""} $fg]
+            set first_5 [string map {"(" ""} [string range $fg_nospace 0 4]]
+            # -cert flag returns list of selected root certificates
+            if { $do_certs }{
+                foreach selection $cert_choices {
+                    if { $first_5 eq $selection }{
+                        # setup to remove duplicate root certificates - tmos supplied ca-bundle can have duplicates
+                        set i 0
+                        set duplicate_split [split [string map "{ } \001" $duplicate] "\001"]
+                        foreach dup $duplicate_split {
+                            if { $dup eq $first_5 }{
+                                incr i
+                            }
+                        }
+                        # add certificate if not a duplicate
+                        if { $i < 1 }{
+                            append final "${subject}-----END CERTIFICATE-----\n"
+                            puts [tmsh::log notice "User:'${username}' Modified CA-Bundle, adding the following Root CA:(SN) ${fg_nospace} Name:${dc}"]
+                            append duplicate "$first_5 "
+                        }
+                    }
+                }
+            } elseif { $dc !="" || $fg_nospace !="" || $restore_table_name eq 1 }{
+                if { $restore_return eq 0 && $restore_table_name eq 0 }{
+                    append final "${dc},SN:${fg_nospace}\t${first_5}\n"
+                } elseif { $restore_table_name eq 1 }{
+                    set table_cert [string first ### $subject]
+                    if { $table_cert > -1 && $table_cert < 500 } {
+                        set ending "$subject-----END CERTIFICATE-----"
+                        set table_certificate [string range $ending [string first -----BEGIN $ending] [ expr { [string first -----END $ending] +24 }]]
+                        append final  "{ row { \"[string map {"\n" " "} $table_certificate]\" \"[string range $subject 4 [expr { [string first \n $subject 1] -1 }]]\" } }"
+                    }
+
+                } else {
+                    set table_cert [string first ### $subject]
+                    if { $table_cert < 0 || $table_cert > 500 } {
+                        append final "${first_5} "
+                    }
+                }
+            }
+        }
+        if { $do_restore && $restore_table_name eq 0 }{
+            set final [string map {"(" ""} $final]
+        }
+        return $final
+    }
+    if { $rest_files }{
+        # Pull TMOS ca-bundle file into list
+        catch { set fn_bak_ca_bundle [exec ls -t /config/ssl/ssl.crt/] } err
+        if { $::errorCode != "" } {
+            puts "Error during file lookup in ssl certificate directory: ${err}"
+            error "Error during file lookup in ssl certificate directory: ${err}"
+        }
+        foreach bak [join "$fn_bak_ca_bundle"] {
+            set full_path "/config/ssl/ssl.crt/$bak"
+            if { [iapp_is full_path $fn_ca_bundle] }{
+                set fn_bak_exists 1
+                break
+            } else {
+                set fn_bak_exists 0
+            }
+        }
+        if { $fn_bak_exists }{
+            puts "Backup of factory TMOS ca-bundle /config/ssl/ssl.crt/ca-bundle.crt, at:${fn_ca_bundle}, already exists. No need to backup"
+        } elseif { $fn_bak_exists eq 0 }{
+            puts "Backing up factory TMOS ca-bundle /config/ssl/ssl.crt/ca-bundle.crt, to ${fn_ca_bundle}."
+            catch { exec cp /config/ssl/ssl.crt/ca-bundle.crt ${fn_ca_bundle} } err
+            if { $::errorCode != "" } {
+                puts "Error creating backup file:${fn_ca_bundle}: ${err}"
+                error "Error creating backup file:${fn_ca_bundle}: ${err}"
+            }
+        }
+        set restore_list [lsearch -all -inline $fn_bak_ca_bundle *_bak*]
+        set restore_final ""
+        foreach res $restore_list {
+            append restore_final "${res}\t${res}\n"
+        }
+        if { $restore_final == "" }{
+            return "No restore files found"
+        } else {
+            return $restore_final
+        }
+    }
+}
+    script-signature kFAQClo+bwCf05v3ao6wxSD7qlkea46Pdo1zdaJx1K/uqUITAGvy/TUmuOMWtqVt1fnwIn9vpMrzvBgJRcEIXvy0pVzhwfLWfCAkIfgHFc6dt5reyT2gWakWZyD1IOiivgFpDYNkSjnH98QAxH/FTXBVnrRGu05zRLRKgUNJDWzgkS0fnyEfzktcffOamBmE97W0ej7DjOI7oyTjXCHC04UWGrARlflxL0pIzBDcJ9YRH/cztjFwoteFVud/MwLA+HxmCUABe1Mp2imXQ4qiVJYq0zYZoU0RDzgsFGjH0E7ss5JHnVFEs7L5avR4CByuRiQieVZz01Fo1fF3drggsg==
+}
+cli script /Common/nist80053_1 {
+ #value of a specified object attribute
+ #initial args:
+ # -none replace "none" with ""
+ # -dfl XXX replace empty value or failure with XXX
+ #
+ #(note that use of list commands here will hose any
+ #unescaped special chars in arguments)
+ proc my_item {args} {
+  tmsh::include f5.iapp.1.5.2.scli
+  set args [join $args]
+  set nun false
+  set dfl ""
+  while {[string index [set opt [lindex $args 0]] 0] eq "-"} {
+   switch -exact -- $opt {
+    "-none" {
+     set nun true
+     set args [lreplace $args 0 0]
+    }
+    "-dfl" {
+     set dfl [lindex $args 1]
+     set args [lreplace $args 0 1]
+    }
+    default {
+     error "my_item: unrecognized option ${opt}"
+    }
+   }
+  }
+  if {[catch {tmsh::get_config $args} dat]} {
+   iapp_debug "failed tmsh::get_config ${args} (${dat})"
+   return $dfl
+  }
+  set idx [list 0 [expr {[llength $args] - 1}] 1]
+  set dat [lindex $dat $idx]
+  set dat [string trim [regsub -all {[[:space:]]+} $dat "\x20"]]
+  if {[regexp {^{(.+)}$} $dat junk foo]} { set dat $foo }
+  if {$nun && ($dat eq "none")} { set dat "" }
+  return [expr {($dat ne "") ? $dat : $dfl}]
+ }
+
+ #list of values of specified object attribute
+ #initial arg "-apl" returns list with newlines for APL
+ proc my_vec {args} {
+  set args [join $args]
+  set apl false
+  if {[lindex $args 0] eq "-apl"} {
+   set apl true
+   set args [lreplace $args 0 0]
+  }
+  set vec [my_item $args]
+  return [expr {$apl ? [join $vec "\n"] : $vec}]
+ }
+
+ #list partitions, with argument $tgt prepended,
+ #optionally include "All" as an extra choice
+ proc list_partitions {tgt {all false}} {
+  set partns [list]
+  if {$all && ($tgt ne "All")} {
+   lappend partns "All"
+  }
+  set objs [tmsh::get_config /auth partition]
+  foreach {obj} $objs {
+   if {[set n [tmsh::get_name $obj]] ne $tgt} {
+    lappend partns $n
+   }
+  }
+  return [concat [list $tgt] [lsort -dictionary $partns]]
+ }
+
+ #currently (TMOS 11.5 through 12.0) system offers no command
+ #to obtainlist of valid roles
+ proc fill_roles {tgt} {
+  tmsh::include f5.iapp.1.5.2.scli
+
+  upvar $tgt roles
+  array unset roles
+  array set roles {
+   acceleration-policy-editor "Acceleration Policy Editor"
+   admin "Administrator"
+   application-editor "Application Editor"
+   auditor "Auditor"
+   certificate-manager "Certificate Manager"
+   firewall-manager "Firewall Manager"
+   guest "Guest"
+   irule-manager "iRule Manager"
+   manager "Manager"
+   no-access "No Access (forbid access even if authenticated)"
+   operator "Operator"
+   resource-admin "Resource Administrator"
+   user-manager "User Manager"
+   web-application-security-administrator "Web Application Security Administrator"
+   web-application-security-editor "Web Application Security Editor"
+  }
+  if {[iapp_tmos_version >= 11.6]} {
+   array set roles {
+    fraud-protection-manager "Fraud Protection Manager"
+   }
+  }
+ }
+
+ proc array2apl {top rray} {
+  upvar $rray opts
+  set apl [list]
+  foreach {val show} [array get opts] {
+   if {$val ne $top} { lappend apl "${show}\t${val}" }
+  }
+  if {[set peak $opts($top)] ne ""} { append peak "\t${top}" }
+  return [join [concat [list $peak] [lsort -dictionary $apl]] "\n"]
+ }
+
+ proc syslog_servers {} {
+  set names [list]
+  if {[set b [my_item -none /sys syslog remote-servers]] ne ""} {
+   foreach {svr attrs} $b { lappend names $svr }
+  }
+  return $names
+ }
+    script-signature ET8ZAcc0/NVYov/rsQyghgjpGZrVFw2n8gRMgqTAL3gayd5cxxFIUoGRgGuBxwngy8H3VdqXKaqWV5Q84FDhvQ5sk3uJlMlend8YnlE9KXaSTpiGaa/zH82j8rqhU6mGBk8G9YG+grWLohTnpYRgjH4hYkK8vnfTeZ0dr5VQcKqgPGFn9HvVbxO4/tlS3Fl60IgOhAN/QJ7w7GJL8FdPAc8csTX0DvqVdBBMVwNYBeWy2EciG0+r5VqJvcrQ8PC7GDw1z4uO1aeTgsW+TxbMldHF3EmLjZ7J+tjtOoIqguPlbAVPexGZDlKJ6uucFRfPynnTaTMhd9hOp8q3KwoDfg==
+}
+sys application template /Common/f5.nist_sp800-53.v1.0.0 {
+    actions {
+        definition {
+            html-help {
+                <h3>NIST Special Publication 800-53r4 iApp</h3>
+<h4>Introduction</h4>
+<p>NIST Special Publication 800-53r4 defines security and privacy
+controls for all U.S. Federal information systems and organizations.
+SP800-53r4 is used by a wide audience inside and outside government
+so this iApp should be useful to many f5 customers.</p>
+
+<h5>Caveats</h5>
+<p>This iApp template is intended to help you achieve compliance to a
+policy which includes a series of security controls. This documentation
+tries to explain clearly how the iApp functions and what to be aware
+of to avoid a false sense of compliance.</p>
+
+<h6>Configuration Folders</h6>
+<p>As of version 11, BIG-IP TMOS supports &ldquo;folders&rdquo;
+within the configuration as a means to group and control
+configuration objects (each Administrative Partition has a folder).
+By default, objects are placed in the /Common folder, and this
+iApp operates on objects in /Common.  However, BIG-IP administrators
+may place objects into other folders explicitly, or implicitly
+by using another iApp (most iApps create subfolders to hold
+configuration objects for the application services they manage).
+The objects managed by <i>this</i> iApp are nearly always kept in
+/Common so subfolders do not pose a problem.  However, be aware of
+the possibility that this iApp could fail to update an object of
+interest (most likely a self IP) created by another iApp outside
+of /Common.</p>
+
+<h6>iApp &ldquo;Strictness&rdquo;</h6>
+<p>Related to the matter of folders, most objects created by any
+particular iApp will be &ldquo;owned&rdquo; by that iApp and attempts
+to modify those objects outside of the originating iApp will fail.
+<i>This</i> iApp can create some objects that will be unmodifiable
+outside of it.  (This is generally desirable since this iApp is
+security-relevant and you would not want uncoordinated changes.)
+However, this iApp also manages many objects which exist on every
+BIG-IP.  This iApp does not create those objects but rather uses
+modify commands to update them without gaining ownership.  If this
+iApp tries to manage some object that happens to have been created
+by another iApp its modify commands may fail and you may have to
+visit the other iApp to make any required changes.</p>
+
+<h6>Modifications Outside This iApp</h6>
+<p>When possible this iApp takes initial values for various options
+from the current system configuration. However, as described above,
+this iApp does not own most of the configuration items it manages
+so many can still be changed outside of it. When that occurs,
+revisiting this iApp's configuration will not show &ldquo;outside&rdquo;
+changes and saving this iApp's configuration will overwrite those
+changes.</p>
+
+<h4>NIST SP800-53r4 Security Controls Review</h4>
+<p>Here is a summary of security controls from Appendix F of NIST
+SP800-53r and how they map to BIG-IP capabilities.</p>
+    <h5>Access Control Family</h5>
+    <h6>AC-1 - Access Control Policy and Procedures</h6>
+    <p>This control would be implemented outside of BIG-IP.</p>
+
+    <h6>AC-2 - Account Management</h6>
+    <p>The lifecycle of user accounts and roles associated with them
+    is the focus of this control. The iApp enables configuration of
+    authentication sources (local, LDAP, RADIUS, <i>etc</i>.) as well
+    as inactivity timeout and remote role assignment
+    in support of this control. Also see SC-10, IA-2.</p>
+
+    <h6>AC-3 - Access Enforcement</h6>
+    <p>Access to the BIG-IP must be made through approved means.
+    Related to AC-2, remote authentication and role determination
+    help satisfy this control.</p>
+
+    <h6>AC-4 - Information Flow Enforcement</h6>
+    <p>This control addresses information flow within and between
+    systems.  The iApp supports this control mainly by enforcing
+    boundary protections; see SC-7.</p>
+
+    <h6>AC-5 - Separation of Duties</h6>
+    <p>Encourages use of role based access control. BIG-IP supports a
+    variety of different security roles.  Users may be assigned roles
+    on the BIG-IP or by reference to a central authority (for example,
+    mapping via an LDAP attribute).</p>
+
+    <h6>AC-6 - Least Privilege</h6>
+    <p>BIG-IP supports this control using role-based access control,
+    Administrative Partitions, and auditing.  The iApp does not include
+    management of Administrative Partitions.  Also see AU-9, CM-5.</p>
+
+    <h6>AC-7 - Unsuccessful Login Attempts</h6>
+    <p>To protect account credentials against brute-force attacks you
+    should lock accounts after a certain number of unsuccessful login
+    attempts. The maximum count is configurable in the template.</p>
+
+    <h6>AC-8 - System Use Notification</h6>
+    <p>You should warn users about policies governing their access to
+    the system.  The iApp helps you configure a suitable
+    &ldquo;banner&rdquo; message for display at logon.</p>
+
+    <h6>AC-9 - Previous Login (Access) Notification</h6>
+    <p>Upon logon, users should be notified of their last successful
+    logon time plus additional logon history. BIG-IP displays the last
+    logon time to SSH and console users but not Management GUI users.
+    Additional logon history information is available via TMSH and
+    shell only.</p>
+
+    <h6>AC-10 - Concurrent Session Control</h6>
+    <p>Limit the number of concurrent sessions by user or account
+    type. BIG-IP can limit the total number of concurrent Management
+    GUI users (though not specific users or account types) so the
+    iApp lets you adjust that number.  No equivalent limits can be
+    placed on command-line or SNMP access.</p>
+
+    <h6>AC-11 - Session Locking</h6>
+    <p>Session locking differs from automatic logout due to idleness
+    because the user&rsquo;s session state is maintained.  BIG-IP does
+    not have this feature.  A screen- or client-locking feature on the
+    user&rsquo;s workstation could help meet this control.</p>
+
+    <h6>AC-12 - Session Termination</h6>
+    <p>The BIG-IP Management GUI displays a suitable message to meet
+    this control, but neither SSH nor console access support it.</p>
+
+    <h6>AC-13 - Supervision and Review</h6>
+    <p>This control has been withdrawn.</p>
+
+    <h6>AC-14 - Permitted Actions without Identification or
+    Authentication</h6>
+    <p>This control addresses actions, if any, available without user
+    authentication or authorization. The BIG-IP does not offer any
+    services to unauthenticated/unauthorized users.</p>
+
+    <h6>AC-15 - Automated Marking</h6>
+    <p>This control has been withdrawn.</p>
+
+    <h6>AC-16 - Security Attributes</h6>
+    <p>This control relates to associating security attributes to
+    information in storage, in process, and in transmission. The iApp
+    does not expose any configuration items related to this.</p>
+
+    <h6>AC-17 - Remote Access</h6>
+    <p>Addressing this control will go beyond the BIG-IP.  However,
+    all remote management access to the BIG-IP uses encrypted
+    transport (AC-17(2)) except SNMP.  Also see SC-7 for boundary
+    protection which also controls remote access.</p>
+
+    <h6>AC-18 - Wireless Access</h6>
+    <p>There are no BIG-IP configuration options specifically related
+    to wireless networking.  This control would mainly be addressed
+    outside BIG-IP and by compliance to SC-7.</p>
+
+    <h6>AC-19 - Access Control for Mobile Devices</h6>
+    <p>There are no BIG-IP configuration options specifically related
+    to mobile devices.  This control would mainly be addressed outside
+    BIG-IP and by compliance to AC-3 and SC-7.</p>
+
+    <h6>AC-20 - Use of External Information Systems</h6>
+    <p>This control relates to communications with systems in other
+    administrative domains.  BIG-IP management only operates in a
+    single administrative domain so no BIG-IP configuration options
+    are responsive.</p>
+
+    <h6>AC-21 - User-Based Collaboration and Information Sharing</h6>
+    <p>This control would be implemented outside of BIG-IP.</p>
+
+    <h6>AC-22 - Publicly Accessible Content</h6>
+    <p>This control would be implemented outside of BIG-IP.</p>
+
+    <h6>AC-23 - Data Mining Protection</h6>
+    <p>This control would be implemented outside of BIG-IP.</p>
+
+    <h6>AC-24 - Access Control Decisions</h6>
+    <p>This control would be implemented outside of BIG-IP.</p>
+
+    <h6>AC-25 - Reference Monitor</h6>
+    <p>This control concerns the incorporation of the
+    &ldquo;reference monitor&rdquo; concept into system design
+    and implementation.  The internal architecture of BIG-IP is
+    beyond the scope of the iApp.</p>
+
+    <h5>Awareness and Training</h5>
+    <p>None of the controls (AT-nn) in this section are relevant
+    to BIG-IP or this iApp.</p>
+
+    <h5>Audit and Accountability</h5>
+
+    <h6>AU-1 - Audit and Accountability Policy and Procedures</h6>
+    <p>This control would be implemented outside of BIG-IP.</p>
+
+    <h6>AU-2 - Audit Events</h6>
+    <p>The iApp lets you activate audit event recording for
+    changes made through TMSH and through MCPD (the latter records
+    changes initiated via any user interface).</p>
+
+    <h6>AU-3 - Content of Audit Records</h6>
+    <p>The contents of BIG-IP audit records are basically fixed.</p>
+
+    <h6>AU-4 - Audit Storage Capacity</h6>
+    <p>Space for storing audit records (logs) on BIG-IP is not
+    directly configurable, but you should send audit records to a
+    remote server (see AU-9) and apply this control that context.</p>
+
+    <h6>AU-5 - Response to Audit Processing Failures</h6>
+    <p>There are no BIG-IP configuration options specifically related
+    to this control.</p>
+
+    <h6>AU-6 - Audit Review, Analysis, and Reporting</h6>
+    <p>This control would be implemented outside of BIG-IP.</p>
+
+    <h6>AU-7 - Audit Reduction and Report Generation</h6>
+    <p>This control would be implemented outside of BIG-IP.</p>
+
+    <h6>AU-8 - Time Stamps</h6>
+    <p>To meet this control you may configure compliant (ISO) time
+    stamps for audit messages (also see AU-12) and NTP server(s)
+    as sources of accurate time (AU-8(1), AU-8(2)).</p>
+
+    <h6>AU-9 - Protection of Audit Information</h6>
+    <p>User roles (AC-6) control access to audit information on BIG-IP.
+    You should send audit records to a remote server (AU-9(2)) and
+    apply this control in that context.  This iApp lets you configure
+    remote syslog servers.</p>
+
+    <h6>AU-10 - Non-Repudiation</h6>
+    <p>There are no BIG-IP configuration options specifically related
+    to this control.</p>
+
+    <h6>AU-11 - Audit Record Retention</h6>
+    <p>BIG-IP Audit record log rollover is not directly configurable.
+    You should send audit records to a remote server and apply this
+    control in that context (see AU-9).</p>
+
+    <h6>AU-12 - Audit Generation</h6>
+    <p>This control would mostly be implemented outside BIG-IP.
+    You may configure compliant (ISO) timestamps for audit messages
+    (AU-12(2), see AU-8).</p>
+
+    <h6>AU-13 - Monitoring for Information Disclosure</h6>
+    <p>This control would be implemented outside of BIG-IP.</p>
+
+    <h6>AU-14 - Session Audit</h6>
+    <p>BIG-IP does not provide the capability envisioned by this control.
+    A portion of this information could be selected from the audit message
+    stream (see AU-2, AU-12).</p>
+
+    <h6>AU-15 - Alternate Audit Capability</h6>
+    <p>The BIG-IP retains copies of audit messages sent to remote
+    servers for a few days, typically (see AU-4).  An alternate
+    procedure to retrieve audit data from BIG-IP could be defined in
+    case a remote audit log server is unavailable or damaged.</p>
+
+    <h6>AU-16 - Cross-Organizational Auditing</h6>
+    <p>This control would be implemented outside of BIG-IP.</p>
+
+    <h6>CA Family of Controls</h6>
+    <p>These controls would be implemented outside of BIG-IP.</p>
+
+    <h6>CM-1 - Configuration Management Policy and Procedures</h6>
+    <p>These controls would be implemented outside of BIG-IP.</p>
+
+    <h6>CM-2 - Baseline Configuration</h6>
+    <p>BIG-IP UCS and SCF files may furnish data required to
+    implement these controls.  f5 Enterprise Manager and BIG-IQ
+    products may also be used.</p>
+
+    <h6>CM-5 - Access Restrictions for Change</h6>
+    <p>BIG-IP RBAC and auditing features support CM-5(1).  This
+    iApp helps you configure those features.  The BIG-IP supports
+    signature verification for TMOS software updates (CM-5(3)).</p>
+
+    <h6>CM-7 - Least Functionality</h6>
+    <p>This iApp lets you adjust the services accessible on self IP&rsquo;s
+    so you can constrain the functionality of BIG-IP in the network.</p>
+
+    <h6>CM-8 - Information System Component Inventory</h6>
+    <p>These controls would be implemented outside of BIG-IP.
+    However, f5 Enterprise Manager or BIG-IQ products may be
+    used in the implementation of these controls.</p>
+
+    <h5>Contingency Planning</h5>
+    <p>Most of the controls (CP-nn) in this family would be
+    implemented outside of BIG-IP.  Some exceptions are noted
+    here.</p>
+
+    <h6>CP-7 - Alternate Processing Site</h6>
+    <p>BIG-IP supports configuration synchronization and functional
+    failover device groups, as well as global traffic management
+    (GTM), so f5 customers can build highly-reliable systems within
+    and among different processing sites (&ldquo;data centers&rdquo;).</p>
+
+    <h6>CP-9 - Information System Backup</h6>
+    <p>BIG-IP typically does not store user data and generally the
+    device configuration is all that must be backed up to enable
+    service recovery in the event of a failure.  Logs may be backed up
+    through remote syslog. Enterprise Manager or BIG-IQ may be used to
+    automate backup of BIG-IP device configuration and historical
+    statistical data.  This iApp only helps you configure remote syslog.</p>
+
+    <h6>CP-10 - Information System Recovery and Reconstitution</h6>
+    <p>You may recover BIG-IP automatically in certain high-availability
+    scenarios, by hand, or using f5 Enterprise Manager or BIG-IQ products.
+    This iApp does include any relevant options.</p>
+
+    <h5>Identification and Authentication</h5>
+    <p>Most of the controls (IA-nn) in this family would be implemented
+    outside of BIG-IP.  Important exceptions are noted here.</p>
+
+    <h6>IA-2 - Identification and Authentication (Organizational Users)</h6>
+    <p>BIG-IP supports user authentication to local or external directories
+    using single- or multi-factor credentials.  This iApp lets you configure
+    external authentication/directory services and parameters.  The only
+    way to disable BIG-IP&rsquo;s shared management user accounts is by
+    configuring &ldquo;Appliance Mode&rdquo; but this iApp does not
+    address that feature.</p>
+
+    <h6>IA-3 Device Identification and Authentication</h6>
+    <p>This iApp helps you configure secure access to external
+    authentication/directory services using TLS/SSL or shared-secret
+    schemes for mutual authentication.</p>
+
+    <h6>IA-4 - Identifier Management</h6>
+    <p>These controls would be implemented outside of BIG-IP.</p>
+
+    <h6>IA-5 - Authenticator Management</h6>
+    <p>This iApp lets you configure password policy for local
+    authentication as well as security for authentication data used
+    with external authentication/directory services.</p>
+
+    <h5>Incident Response</h5>
+    <p>These controls would be implemented outside of BIG-IP.</p>
+
+    <h5>Maintenance</h5>
+    <p>These controls would be implemented outside of BIG-IP.</p>
+
+    <h5>Media Protection</h5>
+    <p>These controls would be implemented outside of BIG-IP.</p>
+
+    <h5>Physical and Environmental Protection</h5>
+    <p>These controls would be implemented outside of BIG-IP.</p>
+
+    <h5>Planning</h5>
+    <p>These controls would be implemented outside of BIG-IP.</p>
+
+    <h5>Personnel Security</h5>
+    <p>These controls would be implemented outside of BIG-IP.</p>
+
+    <h5>Risk Assessment Policy and Procedures</h5>
+    <p>These controls would be implemented outside of BIG-IP.</p>
+
+    <h5>System and Services Acquisition</h5>
+    <p>These controls would be implemented outside of BIG-IP.</p>
+
+    <h5>System and Communications Protection</h5>
+    <p>Many of the controls (SC-nn) in this family would be implemented
+    outside of BIG-IP.  Important exceptions are noted here.</p>
+
+    <h6>SC-5 - Denial of Service Protection</h6>
+    <p>BIG-IP is hardened against certain Denial of Service attacks
+    but this iApp only lets you configure the failed login retry
+    limit.  Note that this iApp relates to the management functions
+    of the BIG-IP.  Very extensive and powerful controls outside this
+    iApp are applicable to application traffic handled by BIG-IP.</p>
+
+    <h6>SC-7 - Boundary Protection</h6>
+    <p>This iApp lets you manage the IP subnets from which BIG-IP
+    management may be accessed  as well as services accessible on
+    self IP&rsquo;s.</p>
+
+    <h6>SC-10 - Network Disconnect</h6>
+    <p>This iApp exposes several timeout settings for access to the
+    system.</p>
+
+    <h6>SC-17 - Public Key Infrastructure Certificates</h6>
+    <p>This iApp does not manage TLS/SSL PKI certificates or cryptographic
+    material as such.  However, you can select the appropriate certificates
+    and keys for single-ended and mutual authentication of connections to
+    external authentication/directory services.</p>
+
+    <h6>SC-21 - Secure Name/Address Resolution Service</h6>
+    <p>As of this writing the BIG-IP management plane does not
+    offer support for DNSsec which this iApp can access.</p>
+
+    <h5>System and Information Integrity</h5>
+    <p>These controls would be implemented outside of BIG-IP.</p>
+            }
+            implementation {
+                tmsh::include f5.iapp.1.5.2.scli
+package require sha1
+tmsh::include nist80053_1
+
+iapp_template start
+
+iapp_debug "ensure log obscures 'bind-pw'"
+if {[info exists ::SENSITIVES]} { lappend ::SENSITIVES bind-pw }
+
+# A NOTE TO THE READER
+#
+# This iApp is not a very good model to study when you are learning
+# to write iApps for application service deployment.  This iApp only
+# processes BIG-IP management parameters which are oblique to most
+# applications.
+
+
+# make iApp error display a bit more readable
+proc fail {err} {
+ tmsh::include f5.iapp.1.5.2.scli
+
+ set msg "\n______________________________________________________________\n\n"
+ append msg "\n${err}\n\n" $msg
+
+ error ${msg}
+
+ iapp_debug "proc 'fail'-- should never get here!"
+} ; #proc fail
+
+
+set in_AM [lindex [tmsh::get_config /sys db systemauth.disablerootlogin] [list 0 3 1]]
+if {$in_AM eq "true"} {
+ fail "You cannot use this iApp until you disable BIG-IP Appliance Mode."
+}
+
+
+#NOTE WELL:  IF YOU MODIFY THIS iApp TEMPLATE YOU SHOULD
+#UPDATE THIS PROC ACCORDINGLY
+#
+#We modify control-plane settings and cannot rely
+#on app-service stuff to clean up if customer wants to
+#discontinue using iApp, so we record system settings
+#on initial load and offer to revert to them on demand.
+#This proc compiles a list of commands to restore system
+#state no matter what customer has done using iApp.
+#
+#If argument ck is true, return only sha1 of config, else
+#config (a list of commands plus sha1 as final element)
+proc prep_revert {ck} {
+ tmsh::include f5.iapp.1.5.2.scli
+ package require sha1
+ set doit [list]
+
+ #record many as five remote roles
+ for {set i 1} {$i < 6} {incr i} {
+   set name "rmt-role-${i}"
+   if {[catch {tmsh::get_config /auth remote-role role-info "{ ${name} }" } tmp] ||
+       ([lindex $tmp [list 0 2 1]] eq "none")} {
+     lappend doit "modify /auth remote-role role-info delete { ${name} }"
+   } else {
+     set str ""
+     foreach {n v} [lindex $tmp [list 0 2 1 1]] {
+       if {($n eq "console") && ($v eq "none")} {
+         #bug in TMGUI lets admin set bogus value
+         set v "disabled"
+       }
+       append str "\x20${n} ${v}"
+     }
+     lappend doit "modify /auth remote-role role-info modify { ${name} { ${str} } }"
+   }
+ }
+
+ #LDAP system-auth
+ if {[catch {tmsh::get_config /auth ldap system-auth all-properties} tmp] ||
+     ([lindex $tmp 0] eq "")} {
+   lappend doit "delete /auth ldap system-auth"
+ } else {
+   set str ""
+   foreach {n v} [lindex $tmp [list 0 3]] {
+     switch -exact -- $n {
+       "partition" {
+         continue ; # set n "" ; set v ""
+       }
+       "servers" {
+         set v "replace-all-with { ${v} }"
+       }
+     }
+     append str "\x20${n} ${v}"
+   }
+   lappend doit "modify /auth ldap system-auth ${str}"
+ }
+
+ #RADIUS system-auth
+ lappend doit "delete /auth radius system-auth"
+ set ctr 1
+ while {$ctr <= 10} {
+  set tgt "system_auth_name${ctr}"
+  if {[catch {tmsh::get_config /auth radius-server ${tgt} all-properties} tmp] ||
+      ([lindex $tmp 0] eq "")} {
+    lappend doit "delete /auth radius-server ${tgt}"
+  } else {
+    set str ""
+    foreach {n v} [lindex $tmp [list 0 3]] {
+      switch -exact -- $n {
+        "partition" {
+          continue ; # set n "" ; set v ""
+        }
+      }
+      append str "\x20${n} ${v}"
+    }
+    lappend doit "delete /auth radius-server ${tgt}"
+    lappend doit "create /auth radius-server ${tgt} { ${str} }"
+  }
+  incr ctr
+ }
+ if {![catch {tmsh::get_config /auth radius system-auth all-properties} tmp] &&
+     ([lindex $tmp 0] ne "")} {
+   set str ""
+   foreach {n v} [lindex $tmp [list 0 3]] {
+     switch -exact -- $n {
+       "partition" {
+         continue ; # set n "" ; set v ""
+       }
+       "servers" {
+         set v "replace-all-with { ${v} }"
+       }
+     }
+     append str "\x20${n} ${v}"
+   }
+   lappend doit "create /auth radius system-auth { ${str} }"
+ }
+
+ #TACACS+ system-auth
+ if {[catch {tmsh::get_config /auth tacacs system-auth all-properties} tmp] ||
+     ([lindex $tmp 0] eq "")} {
+   lappend doit "delete /auth tacacs system-auth"
+ } else {
+   set str ""
+   foreach {n v} [lindex $tmp [list 0 3]] {
+     switch -exact -- $n {
+       "partition" {
+         continue ; # set n "" ; set v ""
+       }
+       "servers" {
+         set v "replace-all-with { ${v} }"
+       }
+     }
+     append str "\x20${n} ${v}"
+   }
+   lappend doit "modify /auth tacacs system-auth { ${str} }"
+ }
+
+ #APM system-auth
+ if {[iapp_get_provisioned apm]} {
+   if {[catch {tmsh::get_config /auth apm-auth system-auth all-properties} tmp] ||
+       ([lindex $tmp 0] eq "")} {
+     lappend doit "delete /auth apm-auth system-auth"
+   } else {
+     set str ""
+     foreach {n v} [lindex $tmp [list 0 3]] {
+        switch -exact -- $n {
+         "partition" {
+           continue ; # set n "" ; set v ""
+         }
+       }
+       append str "\x20${n} ${v}"
+     }
+     lappend doit "modify /auth apm-auth system-auth { ${str} }"
+   }
+ }
+
+ #self IP open ports (services)
+ if {[catch {tmsh::get_config /net self-allow defaults} tmp] ||
+     ([lindex $tmp 0] eq "")} {
+   fail "error: unable to retrieve self-allow defaults"
+ } else {
+   set props [lindex $tmp [list 0 2 1]]
+   if {($props eq "none") || ($props eq "all")} {
+    lappend doit "modify /net self-allow defaults ${props}"
+   } else {
+    lappend doit "modify /net self-allow defaults replace-all-with { ${props} }"
+   }
+ }
+
+ if {[catch {tmsh::get_config /net self allow-service} tmp] ||
+     ([lindex $tmp 0] eq "")} {
+   fail "error: unable to get info about self-IPs"
+ } else {
+   foreach {obj} $tmp {
+     set n [tmsh::get_name $obj]
+     set v [lindex $obj [list 3 1]]
+     if {($v eq "none") || ($v eq "all")} {
+       set t2mp $v
+     } else {
+       set t2mp "replace-all-with { $v }"
+     }
+     lappend doit "modify /net self ${n} allow-service ${t2mp}"
+   }
+ }
+
+ #password-policy
+ if {[catch {tmsh::get_config /auth password-policy all-properties} tmp] ||
+     ([lindex $tmp 0] eq "")} {
+   fail "error:  unable to get info about password-policy"
+ } else {
+   set str ""
+   foreach {n v} [lindex $tmp [list 0 2]] {
+     switch -exact -- $n {
+       "partition" {
+         continue ; # set n "" ; set v ""
+       }
+     }
+     append str "\x20${n} ${v}"
+   }
+   lappend doit "modify /auth password-policy { $str }"
+ }
+
+ #NTP servers
+ if {[catch {tmsh::get_config /sys ntp servers} tmp] ||
+     ([lindex $tmp 0] eq "")} {
+   fail "error:  unable to get info about NTP servers"
+ } else {
+   set props [lindex $tmp [list 0 2 1]]
+   if {($props eq "none") || ($props eq "")} {
+    lappend doit "modify /sys ntp servers none"
+   } else {
+    lappend doit "modify /sys ntp servers replace-all-with { ${props} }"
+   }
+ }
+
+ #SYLOG servers
+ if {[catch {tmsh::get_config /sys syslog all-properties} tmp] ||
+     ([lindex $tmp 0] eq "")} {
+   fail "error:  unable to get info about SYSLOG servers"
+ } else {
+   set props [lindex $tmp [list 0 2]]
+   set x [lsearch -exact $props "remote-servers"]
+   foreach {n v} [lindex $props [incr x]] {
+     if {$n starts_with "nist80053iapp-"} {
+      lappend doit "modify /sys syslog remote-servers modify { $n { $v } }"
+     }
+   }
+ }
+
+ #TMGUI allow addrs
+ if {[catch {tmsh::get_config /sys httpd allow} tmp] ||
+     ([lindex $tmp 0] eq "")} {
+   fail "error:  unable to get info about HTTPD allow"
+ }
+ set props [lindex $tmp [list 0 2 1]]
+ if {$props eq "none"} {
+   lappend doit "modify /sys httpd allow none"
+ } else {
+   lappend doit "modify /sys httpd allow replace-all-with { ${props} }"
+ }
+
+ #SSH allow addrs
+ if {[catch {tmsh::get_config /sys sshd allow} tmp] ||
+     ([lindex $tmp 0] eq "")} {
+   fail "error:  unable to get info about SSH allow"
+ }
+ set props [lindex $tmp [list 0 2 1]]
+ if {$props eq "none"} {
+   lappend doit "modify /sys sshd allow none"
+ } else {
+   lappend doit "modify /sys sshd allow replace-all-with { ${props} }"
+ }
+
+ #SNMP allow addrs
+ if {[catch {tmsh::get_config /sys snmp allowed-addresses} tmp] ||
+     ([lindex $tmp 0] eq "")} {
+   fail "error:  unable to get info about SNMP allow"
+ }
+ set props [lindex $tmp [list 0 2 1]]
+ if {$props eq "none"} {
+   lappend doit "modify /sys snmp allowed-addresses none"
+ } else {
+   lappend doit "modify /sys snmp allowed-addresses replace-all-with { ${props} }"
+ }
+
+ #miscellaneous -- plus fix up {/auth source type} last.
+ #target is tmsh reference, if its boolean is true then
+ #we process string value very defensively
+ set targets {
+   {/auth remote-user default-role} false
+   {/auth remote-user remote-console-access} false
+   {/sys global-settings gui-security-banner} false
+   {/sys global-settings gui-security-banner-text} true
+   {/sys sshd banner} false
+   {/sys sshd banner-text} true
+   {/sys syslog iso-date} false
+   {/cli global-settings audit} false
+   {/sys httpd max-clients} false
+   {/sys httpd auth-pam-idle-timeout} false
+   {/sys httpd auth-pam-dashboard-timeout} false
+   {/sys sshd inactivity-timeout} false
+   {/sys global-settings console-inactivity-timeout} false
+   {/cli global-settings idle-timeout} false
+   {/auth source type} false
+ }
+ if {[iapp_tmos_version >= 11.5.3]} {
+  lappend targets {/sys daemon-log-settings mcpd audit} false
+  lappend targets {/sys daemon-log-settings mcpd log-level} false
+ } else {
+  lappend targets {/sys db config.auditing value} false
+ }
+ set rpl {
+   "\x5c" "\x5c\x5c"
+   "\x20" "\x5c\x20"
+   "\x22" "\x5c\x22"
+   "\x27" "\x5c\x27"
+   "*" "\x5c*"
+   "?" "\x5c?"
+ }
+ foreach {tgt qt} $targets {
+   set val [eval my_item $tgt]
+   if {$qt} {
+     set val [regsub {^[\x22\x27](.*)[\x22\x27]$} $val {`\1`}]
+     set val [string map $rpl $val]
+   }
+   lappend doit "modify ${tgt} ${val}"
+ }
+
+ set doit [regsub -all {[[:space:]]+} $doit "\x20"]
+ binary scan $doit H* hexdoit
+ set sha1 [sha1::sha1 -hex $hexdoit]
+ return [expr {$ck ? $sha1 : [list $hexdoit $sha1]}]
+} ; #prep_revert
+
+
+# Read in an APL table even when some columns are empty or contain spaces:
+#  table=name of table variable (like ::xx__tbl)
+#  cols=list of column names, in desired order, like {name ip port}
+# Returns a list of lists; each inner list is column values (no names) from
+# one table row in the order specified.  Column values may be empty strings,
+# like: {{hello "" "value with embedded spaces"} {goodbye "to all that" ""}}
+proc scan_APL_table {table cols} {
+ if {![info exists [set table]] || ![llength [set [set table]]]} { return [list] }
+
+ set matrix [list]
+ foreach {row} [set [set table]] {
+  set rank [list]
+  foreach {elem} [split [join $row] "\n"] {
+   if {$elem eq ""} { continue }
+   set n [set v ""]
+   regexp {^\s*(\S+)\s*(.*)$} $elem junk n v
+   lappend rank $n $v
+  }
+  set line [list]
+  foreach {name} $cols {
+   set val ""
+   if {[set x [lsearch -exact $rank $name]] >= 0} {
+    set val [lindex $rank [incr x]]
+   }
+   lappend line $val
+  }
+  lappend matrix $line
+ }
+ return $matrix
+} ; #proc scan_APL_table
+
+
+tmsh::cd /Common
+
+set myfolder "${tmsh::app_name}.app/${tmsh::app_name}"
+
+if {![info exists ::revert_doit]} {
+ #we must be enjoying first visit to this iApp
+ set ::revert_doit [prep_revert false]
+ iapp_conf "modify /sys application service ${myfolder} variables add { revert_doit { value \x22${::revert_doit}\x22 } }"
+
+ set dttm [clock format [clock seconds] -format "%A %Y-%m-%dT%H:%M:%SZ" -gmt 1]
+ iapp_conf "modify /sys application service ${myfolder} variables add { hideme__firstsave { value \x22${dttm}\x22 } intro__revert_dttm { value \x22${dttm}\x22 } }"
+} else {
+ #refresh user-visible first-save date in case user munged it
+ iapp_conf "modify /sys application service ${myfolder} variables modify { intro__revert_dttm { value \x22${::hideme__firstsave}\x22 } }"
+}
+
+if {[iapp_is ::intro__may_revert "Yes"] &&
+    [iapp_is ::intro__revert_now "revert"]} {
+ #recover the original settings of all the stuff we may adjust
+ set MIC [lindex $::revert_doit end]
+ set hexdoit [lindex $::revert_doit 0]
+ if {$MIC ne [sha1::sha1 -hex $hexdoit]} {
+  fail "Original configuration integrity-check failed-- cannot restore"
+ } else {
+  set doit [binary format H* $hexdoit]
+  foreach {op} $doit {
+   iapp_conf $op
+  }
+ }
+} else {
+ #begin apply iApp config
+
+ set userdir $::ac6__user_dir
+ if {$userdir eq "local"} {
+  #if local authN/directory, reset remote-role stuff to defaults
+  iapp_conf "modify /auth remote-user default-role no-access"
+  iapp_conf "modify /auth remote-user remote-console-access disabled"
+ } else {
+  set rr $::ac6__ext_role
+  set tmp [expr {($rr eq "no-access") ? "disabled" : $::ac6__ext_console}]
+  iapp_conf "modify /auth remote-user default-role ${rr}"
+  iapp_conf "modify /auth remote-user remote-console-access ${tmp}"
+  if {[iapp_is ::ac3__rr1 "Yes"]} {
+   #update many as five remote roles
+   set names [list]
+   set roles [list]
+   set i 1
+   while {$i < 6} {
+    set name "rmt-role-${i}"
+
+    set attrib [set "::ac3__rr${i}a__attrib"]
+    set val [set "::ac3__rr${i}a__val"]
+    set deny [set "::ac3__rr${i}b__deny"]
+    set role [set "::ac3__rr${i}b__role"]
+    set term [set "::ac3__rr${i}c__term"]
+    set partn [set "::ac3__rr${i}c__partn"]
+
+    if {($attrib ne "") || ([string index $role 0] eq "%")} {
+     lappend names $name
+
+     if {$role eq ""} {
+      set "::ac3__rr${i}b__role" [set role "no-access"]
+     }
+     if {$term eq ""} {
+      set "::ac3__rr${i}c__term" [set term "disabled"]
+     }
+     if {$partn eq ""} {
+      set "::ac3__rr${i}c__partn" [set partn "Common"]
+     }
+
+     set roal "${name} \x7b "
+     if {$attrib ne ""} {
+      append roal "attribute \x22${attrib}=${val}\x22 "
+     }
+     append roal "console [iapp_make_safe_password $term] deny ${deny} "
+     append roal "description none line-order 110${i} "
+     append roal "role [iapp_make_safe_password $role] "
+     append roal "user-partition [iapp_make_safe_password $partn] \x7d"
+     lappend roles $roal
+    }
+
+    if {![iapp_is "::ac3__rr[incr i]" "Yes"]} { break }
+   }
+   if {[llength $names]} {
+    iapp_conf "modify /auth remote-role role-info delete { [join $names] }"
+
+    set role_str "add { [join $roles] }"
+    iapp_conf "modify /auth remote-role role-info ${role_str}"
+   }
+  }
+ }
+
+ #:::::::::::::::::::::::::::::::::::::::::::::
+ # what about cert-ldap?                     ::
+ # almost undocumented in 11.6               ::
+ # ! don't forget httpd ssl-verify-client    ::
+ #:::::::::::::::::::::::::::::::::::::::::::::
+
+ # NOTE:  we cannot pre-fill APL table values, so in order to
+ # retain any authentication-server setup that the user already
+ # entered in TMGUI we show a primary and first-alternate auth
+ # server config in ordinary vars, then accumulate additional
+ # servers in a table.  If the user had configured more than two
+ # auth servers (using TMSH, say) then we don't show or preserve
+ # the extras BUT WE CAN RESTORE THEM along with the rest of the
+ # original config.
+
+ #TMOS may throw an error if we mess with current authN
+ #source, so we temporarily revert to local
+ iapp_conf modify /auth source type local
+
+ switch -exact $userdir {
+  "local" {
+   iapp_debug "no options needed for local user-store authentication"
+  }
+  "ldap" -
+  "active-directory" {
+   if {$::ia2__l_bind_pw1 ne $::ia2__l_bind_pw2} {
+    fail "LDAP/MSAD service account secret and confirm values do not match"
+   }
+   set l_pw [expr {($::ia2__l_bind_pw1 eq "@_PRESET_@") ? "" :
+                 [iapp_make_safe_password $::ia2__l_bind_pw1]}]
+   set pw_part [expr {($l_pw eq "") ? "" : "bind-pw ${l_pw}"}]
+
+   if {([set l_uid $::ia2__l_uid] eq "") || ($l_uid eq "none")} {
+    set l_uid [expr {($userdir eq "ldap") ? "uid" : "sAMAccountName"}]
+   }
+
+   if {$::ia2__l_ssl eq "enabled"} {
+    set dfl_port 636
+    set l_port $::ia2__l_ssl_port
+    set ssl_part "ssl enabled ssl-ca-cert-file $::ia2__l_ca_cert ssl-client-key $::ia2__l_key ssl-client-cert $::ia2__l_cert"
+   } else {
+    set dfl_port 389
+    set l_port $::ia2__l_nossl_port
+    set ssl_part "ssl disabled"
+   }
+   if {$l_port eq ""} { set l_port $dfl_port }
+
+   set bind_tmout [expr {(($::ia2__l_svr_pri ne "") && ($::ia2__l_svr_alt ne "")) ?
+                         20 : 30}]
+
+   set l_svrs $::ia2__l_svr_pri
+   if {$::ia2__l_svr_alt ne ""} {
+    append l_svrs "\x20" $::ia2__l_svr_alt
+
+    set host ""
+    foreach {row} [scan_APL_table ::ia2__l_svr_more {host}] {
+     foreach {host} $row { break }
+     if {$host eq ""} { continue }
+
+     lappend l_svrs "\x20" $host
+    }
+   }
+
+   set dyngroup [expr {($userdir eq "active-directory") ?
+                       "disabled" : $::ia2__l_dyn_group}]
+   iapp_conf "create /auth ldap system-auth app-service none bind-dn \x22${::ia2__l_bind_dn}\x22 ${pw_part} bind-timeout ${bind_tmout} check-roles-group ${dyngroup} debug ${::ia2__l_debug} login-attribute ${l_uid} port ${l_port} search-base-dn \x22${::ia2__l_base}\x22 servers replace-all-with { ${l_svrs} } scope ${::ia2__l_scope} ${ssl_part}"
+  }
+  "radius" {
+    if {($::ia2__r_p_secret eq "") ||
+        ($::ia2__r_p_secret ne $::ia2__r_p_confirm)} {
+      fail "Primary RADIUS server secret and matching confirm value required"
+    }
+    set pw [expr {($::ia2__r_p_secret eq "@_PRESET_@") ? "" :
+                  [iapp_make_safe_password $::ia2__r_p_secret]}]
+    set pw_part [expr {($pw eq "") ? "" : "secret ${pw}"}]
+
+    # "system_auth_name1/2" are TMGUI's names for RADIUS servers.
+    # Always create the primary host because it's required
+    iapp_conf "create /auth radius-server system_auth_name1 app-service none port ${::ia2__r_p_port} ${pw_part} server ${::ia2__r_p_host}"
+    set r_svrs "system_auth_name1"
+
+    # but only make the alternate if info supplied
+   if {$::ia2__r_s_host ne ""} {
+    if {($::ia2__r_s_secret eq "") ||
+        ($::ia2__r_s_secret ne $::ia2__r_s_confirm)} {
+     fail "Second RADIUS server secret and matching confirm value required"
+    }
+    set pw [expr {($::ia2__r_s_secret eq "@_PRESET_@") ? "" :
+                  [iapp_make_safe_password $::ia2__r_s_secret]}]
+    set pw_part [expr {($pw eq "") ? "" : "secret ${pw}"}]
+
+    iapp_conf "create /auth radius-server system_auth_name2 app-service none port ${::ia2__r_s_port} ${pw_part} server ${::ia2__r_s_host}"
+    append r_svrs "\x20system_auth_name2"
+
+    set ctr 3
+    set host [set secret [set confirm [set port ""]]]
+    foreach {row} [scan_APL_table ::ia2__r_more {host secret confirm port}] {
+     foreach {host secret confirm port} $row { break }
+     if {$host eq ""} { continue }
+
+     if {($secret eq "") || ($secret ne $confirm)} {
+      fail "RADIUS server #${ctr} secret and matching confirm value required"
+     }
+     set pw [iapp_make_safe_password $secret]
+
+     if {![regexp {^[0-9]{1,5}$} $port]} { set port 1812 }
+
+     iapp_conf "create /auth radius-server system_auth_name${ctr} app-service none port ${port} secret ${pw} server ${host}"
+     append r_svrs "\x20system_auth_name${ctr}"
+     if {[incr ctr] > 10} { break }
+    }
+   }
+
+   iapp_conf "create /auth radius system-auth app-service none debug ${::ia2__r_debug} servers replace-all-with { ${r_svrs} }"
+  }
+  "tacacs" {
+   if {$::ia2__t_secret ne $::ia2__t_confirm} {
+    fail "TACACS+ secret and confirm values do not match"
+   }
+   set pw [expr {($::ia2__t_secret eq "@_PRESET_@") ? "" :
+                 [iapp_make_safe_password $::ia2__t_secret]}]
+   set pw_part [expr {($pw eq "") ? "" : "secret ${pw}"}]
+
+   if {[string first "#" $pw] >= 0} {
+    fail "TACACS+ secret must not include '#' character per SOL8808"
+   }
+
+   set t_svrs $::ia2__t_svr_pri
+   if {$::ia2__t_svr_alt ne ""} {
+    append t_svrs "\x20" $::ia2__t_svr_alt
+
+    set host ""
+    foreach {row} [scan_APL_table ::ia2__t_svr_more {host}] {
+     foreach {host} $row { break }
+     if {$host eq ""} { continue }
+
+     append t_svrs "\x20" $host
+    }
+   }
+
+   iapp_conf "create /auth tacacs system-auth app-service none accounting ${::ia2__t_acct} authentication ${::ia2__t_auth} debug ${::ia2__t_debug} encryption ${::ia2__t_enc} protocol ${::ia2__t_proto} ${pw_part} servers replace-all-with { ${t_svrs} } service ${::ia2__t_service}"
+  }
+  "apm-auth" {
+   #APM profile must be predefined outside iApp
+   iapp_conf "create /auth apm-auth system-auth { profile-access ${::ia2__apm_auth_pfl} }"
+  }
+  default {
+   fail "system authentication source not recognized"
+  }
+ } ; #switch userdir
+
+ iapp_conf "modify /auth source type ${userdir}"
+
+
+ set selfip_allow "" ; #default is "no changes"
+ switch -exact $::ac4__self_svc_type {
+  "No Changes" {
+   iapp_debug "make no change to self-ip port lockdown 'allow service'"
+  }
+  "Standard" {
+   iapp_debug "change self-ip port lockdown to factory default"
+   set tmp "ospf:any tcp:domain tcp:f5-iquery tcp:https tcp:snmp tcp:ssh udp:520 udp:cap udp:domain udp:f5-iquery udp:snmp"
+   if {[iapp_tmos_version >= 12.0]} {
+    append tmp "\x20igmp:any pim:any"
+   }
+   set selfip_allow "replace-all-with { ${tmp} }"
+  }
+  "None" {
+   iapp_debug "change self-ip port lockdown to allow-service none"
+   set selfip_allow "none"
+  }
+  "Custom" {
+   iapp_debug "change self-ip port lockdown to allow-service custom"
+
+   #Per SOL12932, tcp:1028 causes BIG-IP HA mirroring failure
+   set msg12932 "ignoring self-ip allow add tcp:1028 per SOL12932"
+
+   set tmp [expr {[iapp_tmos_version >= 12.0] ?
+                  $::ac4__v12_svcs : $::ac4__v11_svcs}]
+
+   set proto [set port ""]
+   foreach {row} [scan_APL_table ::ac4__svcs_cust {proto port}] {
+    foreach {proto port} $row { break }
+    if {($proto eq "") ||
+        ![regexp {^[0-9]{0,5}$} $port] ||
+        (($proto eq "tcp") && ($port == 1028) &&
+         ![catch {iapp_debug $msg12932}])} {
+     continue
+    }
+
+    lappend tmp "\x20${proto}:${port}"
+   }
+
+   if {[set tmp [string trim $tmp]] eq ""} {
+    set selfip_allow "none"
+   } else {
+    set selfip_allow "replace-all-with { ${tmp} }"
+   }
+  }
+  default {
+   fail "Self-IP services option not recognized"
+  }
+ }
+ if {$selfip_allow ne ""} {
+  iapp_debug "set self-allow defaults -- does NOT change any existing self-IP"
+  iapp_conf "modify /net self-allow defaults ${selfip_allow}"
+
+  set tmp [string trim [iapp_get_items -nocomplain -list /net self]]
+  if {$tmp ne ""} {
+   foreach {selfip} $tmp {
+    iapp_conf "modify /net self ${selfip} allow-service ${selfip_allow}"
+   }
+  }
+ }
+
+ #login brute-force attack lockout?
+ iapp_conf "modify /auth password-policy max-login-failures [expr {[iapp_is ::ac7__max_failed_enforce "yes"] ? $::ac7__max_failed_attempts : 0}]"
+
+ if {$::ac8__banner_gui ne ""} {
+  set banner [regsub {^[\x22\x27](.*)[\x22\x27]$} $ac8__banner_gui {`\1`}]
+  set banner [regsub -all {[\x22\x5c]} $banner "\\&"]
+  iapp_conf "modify /sys global-settings gui-security-banner enabled"
+  iapp_conf "modify /sys global-settings gui-security-banner-text \x22${banner}\x22"
+ } else {
+  iapp_conf "modify /sys global-settings gui-security-banner disabled"
+  iapp_conf "modify /sys global-settings gui-security-banner-text none"
+ }
+ if {$::ac8__banner_shell ne ""} {
+  set banner [regsub {^[\x22\x27](.*)[\x22\x27]$} $ac8__banner_shell {`\1`}]
+  set banner [regsub -all {[\x22\x5c]} $banner "\\&"]
+  iapp_conf "modify /sys sshd banner enabled"
+  iapp_conf "modify /sys sshd banner-text \x22${banner}\x22"
+ } else {
+  iapp_conf "modify /sys sshd banner disabled"
+  iapp_conf "modify /sys sshd banner-text none"
+ }
+
+ ## there is an alternative way to show the shell banner--
+ ## it has the upside of showing the banner for console
+ ## logins in addition to ssh, but only shows _after_ a login.
+ # set banner [open /etc/motd w]
+ # puts $banner $::ac8__banner_shell
+ # close $banner
+
+ set ntp_svrs $::au8__ntp_pri
+ if {$::au8__ntp_alt ne ""} {
+  append ntp_svrs "\x20" $::au8__ntp_alt
+
+  set host ""
+  foreach {row} [scan_APL_table ::au8__ntp_more {host}] {
+   foreach {host} $row { break }
+   if {$host eq ""} { continue }
+
+   append ntp_svrs "\x20" $host
+  }
+ }
+ set ntp_svrs [string trim [regsub -all {[[:<:]][Nn][Oo][Nn][Ee][[:>:]]} $ntp_svrs "\x20"]]
+ if {$ntp_svrs ne ""} {
+  iapp_conf "modify /sys ntp servers replace-all-with { ${ntp_svrs} }"
+ } else {
+  iapp_conf "modify /sys ntp servers none"
+ }
+
+ #au9, remote syslog servers
+ iapp_conf "modify /sys syslog iso-date ${::au9__isodate}"
+ foreach {svr} [tmsh::run_proc nist80053_1:syslog_servers] {
+  if {$svr starts_with "nist80053iapp-"} {
+   iapp_conf "modify /sys syslog remote-servers delete { ${svr} }"
+  }
+ }
+ if {[iapp_is ::au9__logsvrs "Yes"]} {
+  set ctr 1
+  set addr [set port [set localip ""]]
+  foreach {row} [scan_APL_table ::au9__syslog {addr port localip}] {
+   foreach {addr port localip} $row { break }
+   if {$addr eq ""} { continue }
+
+   set cmd "host ${addr}"
+
+   if {($port ne "") && ($port ne "*")} {
+    append cmd "\x20remote-port ${port}"
+   }
+   if {($localip ne "") && ($localip ne "*")} {
+    append cmd "\x20local-ip ${localip}"
+   }
+
+   iapp_conf "modify /sys syslog remote-servers add { nist80053iapp-${ctr} { ${cmd} } }"
+   incr ctr
+  }
+ }
+
+ iapp_conf "modify /sys httpd max-clients ${::ac10__gui_max_clients}"
+
+ if {$::ia5__use_pw_policy eq "enabled"} {
+  if {$::ia5__pw_exp__max_life < 1} {
+   set ::ia5__pw_exp__max_life 1
+  }
+  iapp_conf "modify /auth password-policy policy-enforcement enabled minimum-length ${::ia5__pw_req__len} required-lowercase ${::ia5__pw_req__lower} required-numeric ${::ia5__pw_req__numeric} required-special ${::ia5__pw_req__special} required-uppercase ${::ia5__pw_req__upper} max-duration ${::ia5__pw_exp__max_life} password-memory ${::ia5__pw_exp__memory}"
+ } else {
+  iapp_conf "modify /auth password-policy policy-enforcement disabled"
+ }
+
+ iapp_conf "modify /cli global-settings audit ${::au2__audit_tmsh}"
+
+ if {[iapp_tmos_version >= 11.5.3]} {
+  iapp_conf "modify /sys daemon-log-settings mcpd audit ${::au2__audit_mcp}"
+  set tmp [expr {($::au2__audit_mcp eq "all") ? "informational" : "notice"}]
+  iapp_conf "modify /sys daemon-log-settings mcpd log-level ${tmp}"
+ } else {
+  set rpl [list "enabled" "enable" "disabled" "disable"]
+  set tmp [string map $rpl ${::au2__audit_mcp}]
+  iapp_conf "modify /sys db config.auditing value ${tmp}"
+ }
+
+ #various login timeout settings
+ if {[set tmp [expr {$::sc10__mins__timeout_gui * 60}]] == 0} { set tmp 43200 }
+ elseif {$tmp < 120} { set tmp 120 }
+ iapp_conf "modify /sys httpd auth-pam-idle-timeout ${tmp}"
+ iapp_conf "modify /sys httpd auth-pam-dashboard-timeout on"
+
+ if {[set tmp [expr {$::sc10__mins__timeout_ssh * 60}]] == 0} { set tmp 43200 }
+ iapp_conf "modify /sys sshd inactivity-timeout ${tmp}"
+
+ if {[set tmp [expr {$::sc10__mins__timeout_console * 60}]] == 0} { set tmp 43200 }
+ iapp_conf "modify /sys global-settings console-inactivity-timeout ${tmp}"
+
+ if {[set tmp $::sc10__mins__timeout_tmsh] == 0} { set tmp 720 }
+ iapp_conf "modify /cli global-settings idle-timeout ${tmp}"
+
+ switch -exact $::sc7a__mgr_ip_filter {
+  "any" {
+   set web_allow "replace-all-with { All }"
+   set ssh_allow "replace-all-with { all }"
+  }
+  "restrict" {
+   set tmp $::sc7a__mgr_ip_allow
+   if {[regexp -nocase {\ynone\y} $tmp]} {
+    #"none" actually means "All" per TMSH Reference Guide
+    #but that is very confusing so we error out
+    fail "management IP allow 'none' is not supported by this iApp"
+   }
+   if {($tmp eq "") || [regexp -nocase {\yall\y} $tmp]} {
+    set web_allow "replace-all-with { All }"
+    set ssh_allow "replace-all-with { all }"
+   } else {
+    if {[regexp -nocase {[^0-9a-f:.%/\x20]} $tmp]} {
+     fail "management IP source address(es) invalid"
+    }
+    set web_allow "replace-all-with { ${tmp} }"
+    set ssh_allow "replace-all-with { ${tmp} }"
+   }
+  }
+  default {
+   fail "management IP filtering type not recognized"
+  }
+ }
+ iapp_conf "modify /sys httpd allow ${web_allow}"
+ iapp_conf "modify /sys sshd allow ${ssh_allow}"
+
+ switch -exact $::sc7b__snmp_ip_filter {
+  "self" {
+   set snmp_allow "replace-all-with { 127.0.0.0/8 ::1 }"
+  }
+  "none" {
+   set snmp_allow "none"
+  }
+  "restrict" {
+   set tmp $::sc7b__snmp_ip_allow
+   if {$tmp eq ""} {
+    set snmp_allow "replace-all-with { 127.0.0.0/8 ::1 }"
+   } elseif {[regexp -nocase {none} $tmp]} {
+    set snmp_allow "none"
+   } elseif {[regexp -nocase {[^0-9a-f:.%/ ]} $tmp]} {
+    fail "SNMP IP source address(es) invalid"
+   } else {
+    append tmp "\x20127.0.0.0/8 ::1"
+    set snmp_allow "replace-all-with { ${tmp} }"
+   }
+  }
+  default {
+   fail "SNMP IP filtering type not recognized"
+  }
+ }
+ iapp_conf "modify /sys snmp allowed-addresses ${snmp_allow}"
+} ; #end apply iApp config
+
+iapp_template end
+            }
+            macro {
+            }
+            presentation {
+                optional ("hide" == "me") {
+    section hideme {
+        string firstsave display "xxlarge" default ""
+        string in_AM display "small" default tcl {
+            return [lindex [tmsh::get_config /sys db systemauth.disablerootlogin] [list 0 3 1]]
+        }
+    }
+}
+section intro {
+
+    message welcome "This iApp helps you configure BIG-IP to support security controls consonant with NIST Special Publication 800-53r4.  This iApp focuses on management of the BIG-IP itself rather than control of application traffic through the BIG-IP. For more details on this iApp and how it supports NIST Special Publication 800-53r4, please consult the Deployment Guide or the Help tab (in the left column on this page)."
+    optional (hideme.in_AM == "true") {
+        message AM_warn "You cannot use this iApp while your BIG-IP is in Appliance Mode."
+    }
+  optional (hideme.in_AM == "false") {
+    choice help display "xxlarge" {
+        "No, do not show inline help" => "hide"  ,
+        "Yes, show inline help" => "show"
+    }
+    optional ( help == "show" ) {
+        message help_help "This template offers extensive inline assistance, notes, and configuration tips. We strongly recommend reading the inline help presented in the template until you are familiar with the functionality and implications of the deployment options. Important notes and warnings are always shown no matter which selection you make."
+    }
+
+    choice sterile display "xxlarge" {
+        "No, do not show advice-only blocks" => "Hide"  ,
+        "Yes, show advice-only blocks" => "Show"
+    }
+    optional (help == "show") {
+        message sterile_help "Each block (section) in this iApp template brings together configuration options related to the NIST SP800-53r4 controls noted in the block title.  For a few important controls there are currently no BIG-IP configuration options. If you choose to show advice-only blocks, general advice about those controls will be displayed."
+    }
+    optional (hideme.firstsave != "") {
+        choice may_revert display "xxlarge" {
+            "No, do not show the option to revert the configuration" => "No"  , 
+            "Yes, show the option to revert the configuration" => "Yes"
+        }
+        optional (help == "show") {
+            message may_revert_help "Because this iApp can modify BIG-IP objects that it does not 'own', simply deleting the Application Service (iApp instance) will not restore the previous state of your BIG-IP device.  To revert to your previous BIG-IP configuration you must use a special feature of this iApp template. Choose whether you want to see the option to revert the iApp configuration."
+        }
+        optional (may_revert == "Yes") {
+            message revert_warn "When you first created this Application Service (iApp instance) at the date and time shown, the system recorded the pre-existing values of all the configuration options it controls.  To restore that configuration, select 'Yes, revert to the pre-iApp configuration when I click Finished' and then click the 'Finished' button.  After clicking 'Finished', you may delete this Application Service (iApp instance) to return the system to its pre-iApp state."
+            string revert_dttm display "xxlarge" default ""
+            optional (help == "show") {
+                message revert_dttm_help "This field shows the date, time, and time zone when you first created this Application Service."
+            }
+            choice revert_now display "xxlarge" {
+                "No, use the settings configured in this iApp template" => "iapp"  ,
+                "Yes, revert to the pre-iApp configuration when I click Finished" => "revert"
+            }
+            optional (help == "show") {
+                message revert_now_help "Choose whether you want to revert to the settings on the BIG-IP system before you first configured this iApp template, or if you want to continue to use the settings you configured in this iApp. If you choose to revert the configuration, after clicking Finished, you may delete the iApp Application service to return the system to its pre-iApp state."
+            }
+        }
+    }
+  }
+}
+
+optional ((intro.revert_now == "iapp") && (hideme.in_AM == "false")) {
+ section ac6 {
+    message purpose "Configure authentication/directory service for BIG-IP management." 
+
+    choice user_dir display "xxlarge" tcl {
+
+        array set opts {
+            active-directory "Active Directory (using LDAP)"
+            ldap "LDAP"
+            local "Local to the BIG-IP system"
+            radius "RADIUS"
+            tacacs "TACACS+"
+        }
+        set crnt [tmsh::run_proc nist80053_1:my_item -dfl "local" \
+            /auth source type]
+
+        set have_apm_pfls [tmsh::run_proc f5.iapp.1.5.2.scli:iapp_get_items -nocomplain -exists \
+                          -filter type eq system-authentication \
+                          /apm profile access]
+        if {($crnt eq "apm-auth") || $have_apm_pfls} {
+            #offer APM authN only if suitable APM Profile on tap 
+            array set opts {
+                apm-auth "BIG-IP Access Policy Manager"
+            }
+        }
+        return [tmsh::run_proc nist80053_1:array2apl $crnt opts]
+    }
+    optional (intro.help == "show") {
+        message user_dir_help "Select the authentication/directory service you want to use.  If you choose 'Local to the BIG-IP system', continue to the next block.  If you wish to use Kerberos authentication (e.g., to allow single-sign-on (SSO) with MS Active Directory) you must create a suitable BIG-IP APM System Authentication Profile outside this iApp, then choose 'BIG-IP Access Policy Manager' as the authentication/directory service."
+    }
+    optional (user_dir != "local") {
+        choice ext_role display "xxlarge" tcl {
+
+            tmsh::run_proc nist80053_1:fill_roles opts
+            set crnt [tmsh::run_proc nist80053_1:my_item \
+                /auth remote-user default-role]
+            return [tmsh::run_proc nist80053_1:array2apl $crnt opts]
+        }
+        optional (intro.help == "show") {
+            message ext_help "A user who can authenticate to the external authentication/directory service but who has no BIG-IP local account will be assigned a BIG-IP management role and console-access privilege either by (a) a remote role (configured below) linked to an external directory attribute; or (b) the default role (and default console access privilege) configured here.  For best security choose default role 'No Access'."
+        }
+        optional (ext_role != "no-access") {
+            choice ext_console display "xxlarge" tcl {
+
+                array set opts {
+                    disabled "No, remote users may access only the management GUI"
+                    tmsh "Yes, remote users may access the TMSH console" 
+                }
+                set crnt [tmsh::run_proc nist80053_1:my_item -dfl "disabled" \
+                    /auth remote-user remote-console-access]
+                return [tmsh::run_proc nist80053_1:array2apl $crnt opts]
+            }
+            optional (intro.help == "show") {
+                message ext_console_help "Indicate whether external users should have access to the TMSH command line console.  If unsure, we recommend selecting 'No' for a higher level of security."
+            }
+        }
+    }
+ }
+
+optional (ac6.user_dir != "local") {
+ section ia2 {
+    optional ((ac6.user_dir == "active-directory") ||
+              (ac6.user_dir == "ldap")) {
+        message ldap_help "Configure the Active Directory or LDAP service you selected.  For Active Directory or LDAP authentication you must supply several parameters, then indicate which directory server(s) the BIG-IP should trust to authenticate and authorize management users."
+
+        string l_uid display "xxlarge" default tcl {
+
+            tmsh::run_proc nist80053_1:my_item -none \
+                /auth ldap system-auth login-attribute
+        }
+        optional (intro.help == "show") {
+            message l_uid_help "Type the name of the login attribute (it is an attribute of user objects in the directory.  The value stored in the login attribute is the user's login username).  By default this will be sAMAccountName for Microsoft Active Directory or uid for other LDAP directories."
+        }
+        string l_base required display "xxlarge" default tcl {
+
+            tmsh::run_proc nist80053_1:my_item -none \
+                /auth ldap system-auth search-base-dn
+        }
+        optional (intro.help == "show") {
+            message l_base_help "Active Directory or LDAP authentication requires the BIG-IP to search the DIT (Directory Information Tree) for the user object whose login-attribute value matches the username entered at the BIG-IP management-GUI, SSH, or console-login prompt.  Specify the DN (Distinguished Name) of the 'Search Base' object where the search for user objects should begin--for example, OU=users,DC=example,DC=com."
+        }
+        choice l_scope display "xxlarge" tcl {
+
+            array set opts {
+                base "Base"
+                one "OneLevel"
+                sub "Subtree"
+            }
+            set crnt [tmsh::run_proc nist80053_1:my_item -dfl "sub" \
+                /auth ldap system-auth scope]
+            return [tmsh::run_proc nist80053_1:array2apl $crnt opts]
+        }
+        optional (intro.help == "show") {
+            message l_scope_help "The Search Scope indicates how deeply to search the DIT below the Search Base object.  Subtree (the default) causes a search of the whole subtree rooted at the Search Base including that object and all its descendants.  Base (or zero level) indicates a search of the Search Base object only, OneLevel indicates a search of the immediate child objects of the base object.  If you are unsure, select Subtree."
+        }
+
+        optional (ac6.user_dir == "ldap") {
+            choice l_dyn_group display "xxlarge" tcl {
+
+                array set opts {
+                    disabled "Yes. User objects list groups to which user belongs (preferred)"
+                    enabled "No. Query each group to check whether user belongs to it"
+                }
+                set crnt [tmsh::run_proc nist80053_1:my_item -dfl "disabled" \
+                    /auth ldap system-auth check-roles-group]
+                return [tmsh::run_proc nist80053_1:array2apl $crnt opts]
+            }
+            optional (intro.help == "show") {
+                message l_dyn_group_help "You may assign a remote role to a user based on group membership (see below). For each remote role you specify an attribute (like memberOf) and a value (like the DN of a security group object).  Users having that attribute with that value may be assigned that role.  MS Active Directory and many other LDAP directories attach memberOf (or similar) attributes to each user object listing the groups to which the user belongs (each memberOf attribute holds the DN of one group).  That is very efficient because the BIG-IP device makes just one query to learn which groups the user belongs to.  Some LDAP directories do not support memberOf so the BIG-IP device must query each group separately to discover whether a user belongs to it.  In that case, to check for group membership answer the question 'Do directory user objects include group-membership attributes?' with 'No'.  Next, specify one of {memberOf, uniqueMemberOf, memberUidOf} as the remote-role's attribute and the DN of a security group object as its value.  Then for each remote role, the BIG-IP device will check if the user belongs to the specified group by querying whether the group object lists the user's DN (as member or uniqueMember for memberOf or uniqueMemberOf, respectively) or login-name (as memberUid for memberUidOf)."
+            }
+        }
+
+        string l_bind_dn required display "xxlarge" default tcl {
+
+            tmsh::run_proc nist80053_1:my_item -none \
+                /auth ldap system-auth bind-dn
+        }
+        optional (intro.help == "show") {
+            message l_bind_dn_help "The BIG-IP itself needs a service account on the directory server(s) so it can search the DIT.  This 'Search Account' should have READ-ONLY privileges (no write privileges) and may be shared.  For Microsoft Active Directory you may enter the UPN of the Search Account rather than its DN."
+        }
+
+        password l_bind_pw1 required display "xxlarge" default tcl {
+
+            set tmp [tmsh::run_proc nist80053_1:my_item -none \
+                /auth ldap system-auth bind-pw]
+            return [expr {($tmp starts_with "\x24M") ? "@_PRESET_@" : $tmp}]
+        }
+        optional (intro.help == "show") {
+            message l_bind_pw1_help "Type and then confirm the secret (passphrase) for the Search Account."
+        }
+        password l_bind_pw2 required display "xxlarge" default tcl {
+
+            set tmp [tmsh::run_proc nist80053_1:my_item -none \
+                /auth ldap system-auth bind-pw]
+            return [expr {($tmp starts_with "\x24M") ? "@_PRESET_@" : $tmp}]
+        }
+        choice l_ssl display "xxlarge" tcl {
+
+            array set opts {
+                enabled "Yes, use TLS to protect authentication queries"
+                disabled "No, disable TLS (not recommended)"
+            }
+            set crnt [tmsh::run_proc nist80053_1:my_item -dfl "enabled" \
+                /auth ldap system-auth ssl]
+            return [tmsh::run_proc nist80053_1:array2apl $crnt opts]
+        }
+        optional (intro.help == "show") {
+            message l_ssl_help "Choose whether to disable TLS (LDAPS) protection of authentication queries.  Querying Active Directory or LDAP without TLS is supported but not recommended.  Note:  If you disable TLS, user passwords will be exposed on the network!"
+        }
+        optional (l_ssl == "enabled") {
+            string l_ssl_port required display "medium"
+                validator "portnumber" default tcl {
+
+                    set tmp [tmsh::run_proc nist80053_1:my_item -dfl "636" \
+                        /auth ldap system-auth port]
+                    if {$tmp eq "ldap"} { set tmp "389" }
+                    if {$tmp eq "ldaps"} { set tmp "636" }
+                    return $tmp
+            }
+            optional (intro.help == "show") {
+                message l_ssl_port_help "When TLS is enabled you must enter the secure LDAP port to use for this implementation.  Port 636 is the standard LDAPS port.  Port 3269 is the TLS-protected Microsoft Active Directory Global Catalog service."
+            }
+            choice l_ca_cert default "None" display "xxlarge" tcl {
+
+                set ret "None"
+                if {[set tmp [tmsh::run_proc f5.iapp.1.5.2.scli:iapp_get_items -nocomplain -norecursive \
+                        /sys file ssl-cert]] ne ""} {
+                    append ret "\n${tmp}"
+                }
+                return $ret
+            }
+            optional (intro.help == "show") {
+                message l_ca_cert_help "If you want the BIG-IP to validate TLS certificates presented by directory servers (which means refusing to connect to directory servers that don't present valid certificates) select the Certificate Authority (CA) certificate or bundle to be used to validate directory server TLS certificates.  To import a CA certificate, see System > File Management > SSL Certificate List."
+            }           
+            choice l_cert default "None" display "xxlarge" tcl {
+
+                set ret "None"
+                if {[set tmp [tmsh::run_proc f5.iapp.1.5.2.scli:iapp_get_items -nocomplain -norecursive \
+                        /sys file ssl-cert]] ne ""} {
+                    append ret "\n${tmp}"
+                }
+                return $ret
+            }
+            optional (intro.help == "show") {
+                message l_cert_help "If you want the BIG-IP to use a TLS client certificate to authenticate itself to directory servers, select the TLS (SSL) client certificate.  See System > File Management > SSL Certificate List for more information or to import certificates and keys."
+            }
+            choice l_key default "None" display "xxlarge" tcl {
+
+                set ret "None"
+                if {[set tmp [tmsh::run_proc f5.iapp.1.5.2.scli:iapp_get_items -nocomplain -norecursive \
+                        /sys file ssl-key]] ne ""} {
+                    append ret "\n${tmp}"
+                }
+                return $ret
+            }
+            optional (intro.help == "show") {
+                message l_key_help "From the list, select the associated key you imported."
+            }
+        }
+        optional (l_ssl != "enabled") {
+            string l_nossl_port required display "medium"
+                validator "portnumber" default tcl {
+
+                    set tmp [tmsh::run_proc nist80053_1:my_item -dfl "389" \
+                        /auth ldap system-auth port]
+                    if {$tmp eq "ldap"} { set tmp "389" }
+                    if {$tmp eq "ldaps"} { set tmp "636" }
+                    return $tmp
+                }
+            optional (intro.help == "show") {
+                message l_nossl_port_help "When you choose to disable TLS you must enter the unsecure LDAP port to use for this implementation.  Port 389 is the standard unencrypted LDAP port.  Port 3268 is the Microsoft Active Directory Global Catalog service."
+            }
+        }
+
+        string l_svr_pri required display "xxlarge" validator "iporfqdn"
+            default tcl {
+
+                lindex [tmsh::run_proc nist80053_1:my_vec \
+                    /auth ldap system-auth servers] 0
+            }
+        optional (intro.help == "show") {
+            message l_svr_pri_help "Type the IP address or fully-qualified domain name of the primary directory server."
+        }
+        message l_svr_alt_help "If you have multiple directory servers, in the field below type the IP address or fully-qualified domain name of the first alternate directory server (and then hit TAB or click another field).  Once you specify the first alternate server, this iApp allows you to specify additional servers."
+        string l_svr_alt display "xxlarge" validator "iporfqdn"
+            default tcl {
+
+                lindex [tmsh::run_proc nist80053_1:my_vec \
+                    /auth ldap system-auth servers] 1
+            }
+        optional (intro.help == "show") {
+            message l_svr_alt_more_help "Type the IP address or fully-qualified domain name of the first alternate directory server you want to include in this implementation. Once you press the Tab key or click in any other field, an additional question appears asking if you want to include more servers."
+        }
+        optional (l_svr_alt != "") {
+            table l_svr_more {
+                string host display "xlarge" validator "iporfqdn"
+            }
+            optional (intro.help == "show") {
+                message l_svr_more_help "Type the IP address or fully-qualified domain name of each additional directory server you want to include in this implementation."
+            }
+        }
+
+        choice l_debug display "xxlarge" tcl {
+
+            array set opts {
+                disabled "No, do not enable LDAP debugging"
+                enabled "Yes, enable LDAP debugging (rarely needed)"
+            }
+            set crnt [tmsh::run_proc nist80053_1:my_item -dfl "disabled" \
+                /auth ldap system-auth debug]
+            return [tmsh::run_proc nist80053_1:array2apl $crnt opts]
+        }
+        optional (intro.help == "show") {
+            message l_debug_help "Choose whether or not you want to enable LDAP debugging.  Debugging is rarely needed and should not be left running by default because user typing errors may leave passwords in the log."
+        }
+    }
+    optional (ac6.user_dir == "radius") {
+        message r_help "Configure the RADIUS service you selected.  For security it is essential to configure a different shared key between each RADIUS server and the BIG-IP.  Also note that RADIUS encryption of user passwords is very weak."
+
+        string r_p_host required display "xxlarge" validator "iporfqdn"
+            default tcl {
+
+                tmsh::run_proc nist80053_1:my_item \
+                    /auth radius-server system_auth_name1 server
+            }
+        optional (intro.help == "show") {
+            message r_p_host_help "Type the IP address or fully-qualified domain name of the primary RADIUS server."
+        }
+        password r_p_secret required display "xxlarge" default tcl {
+
+            set tmp [tmsh::run_proc nist80053_1:my_item \
+                /auth radius-server system_auth_name1 secret]
+            return [expr {($tmp starts_with "\x24M") ? "@_PRESET_@" : $tmp}]
+        }
+        optional (intro.help == "show") {
+            message r_p_secret_help "Type and then confirm the RADIUS secret shared by the primary RADIUS server and this BIG-IP device."
+        }
+        password r_p_confirm required display "xxlarge" default tcl {
+
+            set tmp [tmsh::run_proc nist80053_1:my_item \
+                auth radius-server system_auth_name1 secret]
+            return [expr {($tmp starts_with "\x24M") ? "@_PRESET_@" : $tmp}]
+        }
+
+        string r_p_port required display "medium"
+            validator "portnumber" default tcl {
+
+                set tmp [tmsh::run_proc nist80053_1:my_item -dfl "1812" \
+                    /auth radius-server system_auth_name1 port]
+                if {$tmp eq "radius"} { set tmp "1812" }
+                return $tmp
+            }
+            optional (intro.help == "show") {
+            message r_p_port_help "Type the port the primary RADIUS server uses (port 1812 is standard)."
+        }
+        message r_s_host_help "If you have multiple RADIUS servers, in the field below type the IP address or fully-qualified domain name of the first alternate RADIUS server (and then hit TAB or click another field).  Once you specify the first alternate server, this iApp allows you to specify additional servers."
+        string r_s_host display "xxlarge" validator "iporfqdn"
+            default tcl {
+
+                tmsh::run_proc nist80053_1:my_item \
+                    /auth radius-server system_auth_name2 server
+            }
+        optional (intro.help == "show") {
+            message r_s_host2_help "Type the IP address or fully-qualified domain name of the first alternate RADIUS server you want to add to the configuration."
+        }
+        optional (r_s_host != "") {
+            password r_s_secret required display "xxlarge" default tcl {
+
+                set tmp [tmsh::run_proc nist80053_1:my_item \
+                    /auth radius-server system_auth_name2 secret]
+                return [expr {($tmp starts_with "\x24M") ? "@_PRESET_@" : $tmp}]
+            }
+            optional (intro.help == "show") {
+                message r_s_secret_help "Type and then confirm the RADIUS secret shared by the first alternate RADIUS server and this BIG-IP device."
+            }
+            password r_s_confirm required display "xxlarge" default tcl {
+
+                set tmp [tmsh::run_proc nist80053_1:my_item \
+                    /auth radius-server system_auth_name2 secret]
+                return [expr {($tmp starts_with "\x24M") ? "@_PRESET_@" : $tmp}]
+            }
+            string r_s_port required display "medium"
+                validator "portnumber" default tcl {
+
+                    set tmp [tmsh::run_proc nist80053_1:my_item -dfl "1812" \
+                        /auth radius-server system_auth_name2 port]
+                    if {$tmp eq "radius"} { set tmp "1812" }
+                    return $tmp
+                }
+            optional (intro.help == "show") {
+                message r_s_port_help "Type the port the first alternate RADIUS server uses (port 1812 is standard)."
+            }
+            message r_more_help "Type the IP address or fully-qualified domain name of each additional RADIUS server plus the corresponding shared secret and port number.  You may configure up to eight additional RADIUS servers (that is, a maximum of ten RADIUS servers altogether)."
+            table r_more {
+                string host display "medium" validator "iporfqdn"
+                password secret display "large"
+                password confirm display "large"
+                string port display "small"
+                    validator "portnumber" default "1812"
+            }
+            optional (intro.help == "show") {
+                message r_even_more_help "Type the IP address or fully-qualified domain name of each additional server, along with the RADIUS secret, and service port, if different than 1812."
+            }
+        }
+
+        choice r_debug display "xxlarge" tcl {
+
+            array set opts {
+                disabled "No, disable RADIUS debugging"
+                enabled "Yes, enable RADIUS debugging (rarely needed)"
+            }
+            set crnt [tmsh::run_proc nist80053_1:my_item -dfl "disabled" \
+                /auth radius system-auth debug]
+            return [tmsh::run_proc nist80053_1:array2apl $crnt opts]
+        }
+        optional (intro.help == "show") {
+            message r_debug_help "Choose whether or not you want to enable RADIUS debugging.  Debugging is rarely needed and should not be left running by default because user typing errors may leave passwords in the log."
+        }
+    }
+    optional (ac6.user_dir == "tacacs") {
+        message tacacs_help "Configure the TACACS+ service you selected. For TACACS+ authentication you must supply several parameters, then indicate which TACACS+ server(s) the BIG-IP should trust to authenticate and authorize management users.  For detailed explanations of TACACS+ parameters consult AskF5 SOL8808."
+
+        string t_service required display "xxlarge" default tcl {
+
+            tmsh::run_proc nist80053_1:my_item \
+                /auth tacacs system-auth service
+        }
+        optional (intro.help == "show") {
+            message t_service_help "The TACACS+ service name specifies which service type the login user will access. Type the appropriate service name here, for example 'shell'."
+        }
+
+        string t_proto display "xxlarge" default tcl {
+
+            tmsh::run_proc nist80053_1:my_item \
+                /auth tacacs system-auth protocol
+        }
+        optional (intro.help == "show") {
+            message t_proto_help "The TACACS+ protocol name specifies the protocol associated with the value you entered for the Service Name. Enter an appropriate protocol name here (typically 'http')."
+        }
+
+        password t_secret required display "xxlarge" default tcl {
+
+            set tmp [tmsh::run_proc nist80053_1:my_item \
+                /auth tacacs system-auth secret]
+            return [expr {($tmp starts_with "\x24M") ? "@_PRESET_@" : $tmp}]
+        }
+        optional (intro.help == "show") {
+            message t_secret_help "Type and then confirm the TACACS+ shared secret.  The secret must NOT contain a pound sign (#) or BIG-IP management authentication will fail per AskF5 SOL12304."
+        }
+        password t_confirm required display "xxlarge" default tcl {
+
+            set tmp [tmsh::run_proc nist80053_1:my_item \
+                /auth tacacs system-auth secret]
+            return [expr {($tmp starts_with "\x24M") ? "@_PRESET_@" : $tmp}]
+        }
+
+        choice t_enc display "xxlarge" default "enabled" tcl {
+
+            array set opts {
+                enabled "Yes, use TACACS+ encryption to protect authentication queries"
+                disabled "No, do not use TACACS+ encryption (not recommended)"
+            }
+            set crnt [tmsh::run_proc nist80053_1:my_item -dfl "enabled" \
+                /auth tacacs system-auth encryption]
+            return [tmsh::run_proc nist80053_1:array2apl $crnt opts]
+        }
+        optional (intro.help == "show") {
+            message t_enc_help "Choose whether you want to use TACACS+ encryption to protect authentication queries.  Using TACACS+ without encryption is supported but not recommended.  Note:  If you choose to disable encryption, user passwords will be exposed on the network!"
+        }
+
+        choice t_auth display "xxlarge" tcl {
+
+            array set opts {
+                use-first-server "Attempt authentication once to the primary server only"
+                use-all-servers "Attempt authentication to each server"
+            }
+            set crnt [tmsh::run_proc nist80053_1:my_item \
+                -dfl "use-first-server" \
+                /auth tacacs system-auth authentication]
+            return [tmsh::run_proc nist80053_1:array2apl $crnt opts]
+        }
+        optional (intro.help == "show") {
+            message t_auth_help "Choose how the system should attempt authentication. If you choose 'Attempt authentication once to the primary server' the BIG-IP system sends authentication requests only to the primary server and authentication fails if it does not respond. If you choose 'Attempt authentication to each server' the system sends an authentication request to each server in turn until one succeeds or the list of servers is exhausted (in which case authentication fails)."
+        }
+
+        choice t_acct display "xxlarge" tcl {
+
+            array set opts {
+                send-to-first-server "No, send accounting information only to the first available server"
+                send-to-all-servers "Yes, send accounting information to all servers"
+            }
+            set crnt [tmsh::run_proc nist80053_1:my_item \
+                -dfl "send-to-first-server" \
+                /auth tacacs system-auth accounting]
+            return [tmsh::run_proc nist80053_1:array2apl $crnt opts]
+        }
+        optional (intro.help == "show") {
+            message t_acct_help "Choose whether the BIG-IP system should send accounting data (such as which services users access and how much network resources they consume) only to the first available TACACS+ server, or to all of the servers you will include in this implementation."
+        }
+
+        string t_svr_pri required display "xxlarge" validator "iporfqdn"
+            default tcl {
+
+                lindex [tmsh::run_proc nist80053_1:my_vec \
+                    /auth tacacs system-auth servers] 0
+            }
+        optional (intro.help == "show") {
+            message t_svr_pri_help "Type the IP address or fully-qualified domain name of the primary TACACS+ server."
+        }
+        message t_svr_alt_help "If you have multiple TACACS+ servers, in the field below type the IP address or fully-qualified domain name of the first alternate TACACS+ server (and then hit TAB or click another field).  Once you specify the first alternate server, this iApp allows you to specify additional servers."
+        string t_svr_alt display "xxlarge" validator "iporfqdn"
+            default tcl {
+
+                lindex [tmsh::run_proc nist80053_1:my_vec \
+                    /auth tacacs system-auth servers] 1
+            }
+        optional (intro.help == "show") {
+            message t_svr_more2_help "Type the IP address or fully-qualified domain name of the first alternate TACACS+ server. After entering the first alternate server, you are able to add additional servers if necessary."
+        }
+        optional (t_svr_alt != "") {
+            table t_svr_more {
+                string host display "xlarge" validator "iporfqdn"
+            }
+            optional (intro.help == "show") {
+                message t_svr_more_help "Type the IP address or fully-qualified domain name of each additional TACACS+ server."
+            }
+        }
+
+        choice t_debug display "xxlarge" tcl {
+
+            array set opts {
+                disabled "No, disable TACACS+ debugging"
+                enabled "Yes, enable TACACS+ debugging (rarely needed)"
+            }
+            set crnt [tmsh::run_proc nist80053_1:my_item -dfl "disabled" \
+                /auth tacacs system-auth debug]
+            return [tmsh::run_proc nist80053_1:array2apl $crnt opts]
+        }
+        optional (intro.help == "show") {
+            message t_debug_help "Choose whether or not you want to enable TACACS+ debugging.  Debugging is rarely needed and should not be left running by default because user typing errors may leave passwords in the log."
+        }
+    }
+    optional (ac6.user_dir == "apm-auth") {
+        optional (intro.help == "show") {
+            message apm_help "You may define a BIG-IP APM System Authentication Profile to check management-user credentials of username and password.  For two-factor authentication (such as RSA SecurID with PIN and token-code) both factors must be entered in the password field (the APM Policy can separate them)."
+        }
+        choice apm_auth_pfl display "xxlarge" tcl {
+
+            return [tmsh::run_proc f5.iapp.1.5.2.scli:iapp_get_items -nocomplain \
+                -filter type eq system-authentication \
+                apm profile access]
+        }
+    }
+ }
+}
+
+optional ((ac6.user_dir == "active-directory") ||
+           (ac6.user_dir == "ldap") ||
+           (ac6.user_dir == "radius") ||
+           (ac6.user_dir == "tacacs")) {
+ section ac3 {
+    message purpose "Configure BIG-IP management roles for (up to five groups of) external users based on directory information (user attributes).  Note: additional roles may be defined outside of this iApp."
+
+    choice rr1 display "xxlarge" {
+        "No (users without local accounts get the default role)" => "No"  ,
+        "Yes (assign roles based on user attributes)" => "Yes"
+    }
+    optional (intro.help == "show") {
+        message help "Every management user has a role for BIG-IP Role-Based Access Control (RBAC).  To those users who do NOT have accounts in the BIG-IP local user database you may assign 'remote roles' based on their external authentication/directory service (Active Directory, LDAP, RADIUS, or TACACS+) attributes.  You may store BIG-IP role data in users' directory attributes then extract and use it here.  You may also, or alternatively, define (in this iApp) up to five distinct 'remote roles' to assign to users who have a certain attribute set to a particular value.  If you need to create more than five remote roles you may configure them outside this iApp."
+    }
+  optional (rr1 == "Yes") {
+
+    row rr1a {
+        string attrib display "medium" default tcl {
+
+            set tmp [tmsh::run_proc nist80053_1:my_item \
+                /auth remote-role role-info rmt-role-1 attribute]
+            lindex [split $tmp "="] 0
+        }
+        string val display "xlarge" default tcl {
+
+            set tmp [tmsh::run_proc nist80053_1:my_item \
+                /auth remote-role role-info rmt-role-1 attribute]
+            lindex [split $tmp "="] 1
+        }
+    }
+    optional (intro.help == "show") {
+        message rr_a_help "Type the name and required value of the directory attribute which determines whether to assign an external user the BIG-IP role specified just below.  If the user lacks the attribute, or if its value is different, the user will not be assigned this role (but may be assigned another role, or the default role for external users).  You may leave the directory-attribute and value fields blank when you extract role information from attributes using the '%xyz' syntax described below.  An example of an attribute name and value (for Active Directory or LDAP) is (attribute name) 'memberOf' and (required value, the DN of a security group object) 'CN=NetworkManagers,OU=IT,OU=Users,DC=example,DC=com'."
+    }
+
+    row rr1b {
+        choice deny display "medium" tcl {
+
+            #if "deny" is "disabled" then remote access is permitted
+            array set opts {
+                disabled "Allow"
+                enabled "Deny"
+            }
+            set crnt [tmsh::run_proc nist80053_1:my_item -dfl "disabled" \
+                /auth remote-role role-info rmt-role-1 deny]
+            return [tmsh::run_proc nist80053_1:array2apl $crnt opts]
+        }
+        editchoice role display "xlarge" tcl {
+
+            tmsh::run_proc nist80053_1:fill_roles opts
+            set crnt [tmsh::run_proc nist80053_1:my_item \
+                /auth remote-role role-info rmt-role-1 role]
+            if {[lsearch -exact [list "" "900" "none"] $crnt] >= 0} {
+                set crnt "no-access"
+            }
+            return [tmsh::run_proc nist80053_1:array2apl $crnt opts]
+        }
+    }
+    optional (intro.help == "show") {
+        message rr_b_help "Indicate whether users having the specified attribute and attribute value are allowed to access BIG-IP management services at all, and if so, what BIG-IP role they should be assigned.  BIG-IP roles listed in the f5 Traffic Management Shell (TMSH) Reference Guide.  You may extract the role from a directory attribute 'xyz' by placing '%xyz' into the BIG-IP role field.  The directory attribute 'xyz' must contain one of the following numeric values indicating a BIG-IP role: 0 (admin), 20 (resource admin), 40 (user manager), 80 (auditor), 100 (manager), 300 (application editor), 350 (advanced operator), 400 (operator), 450 (firewall manager), 500 (certificate manager), 510 (irule manager), 700 (guest), 800 (web application security administrator), 810 (web application security editor), 850 (acceleration policy editor), 900 (no-access).  TMOS version 11.6 and above also recognizes 480 (fraud protection manager)."
+    }
+
+    row rr1c {
+        editchoice term display "medium" tcl {
+
+            array set opts {
+                disabled "Disabled"
+                tmsh "Allow TMSH"
+            }
+            set crnt [tmsh::run_proc nist80053_1:my_item \
+                -dfl "disabled" \
+                /auth remote-role role-info rmt-role-1 console]
+            return [tmsh::run_proc nist80053_1:array2apl $crnt opts]
+        }
+        editchoice partn display "xlarge" tcl {
+
+            set crnt [tmsh::run_proc nist80053_1:my_item \
+                -dfl "Common" \
+                /auth remote-role role-info rmt-role-1 user-partition]
+            set tmp [tmsh::run_proc nist80053_1:list_partitions $crnt true]
+            return [join $tmp "\n"]
+        }
+    }
+    optional (intro.help == "show") {
+        message rr_c_help "For users having the specified attribute and attribute value, indicate whether they are allowed to use the BIG-IP TMSH console.  Also indicate which BIG-IP Partition they may access (note that /Common includes all other partitions).  You may extract the value of either field from a directory attribute 'xyz' by placing '%xyz' into the field.  For TMSH console access 'xyz' must contain 0 (zero) or 1 (one) to indicate disabled or enabled, respectively."
+    }
+    choice rr2 tcl { return "No\nYes" }
+    optional (intro.help == "show") {
+        message rr2_help "Choose whether or not you want to add another role.  You can add a total five roles in this section."
+    }
+
+   optional (rr2 == "Yes") {
+    row rr2a {
+        string attrib display "medium" default tcl {
+
+            set tmp [tmsh::run_proc nist80053_1:my_item \
+                /auth remote-role role-info rmt-role-2 attribute]
+            lindex [split $tmp "="] 0
+        }
+        string val display "xlarge" default tcl {
+
+            set tmp [tmsh::run_proc nist80053_1:my_item \
+                /auth remote-role role-info rmt-role-2 attribute]
+            lindex [split $tmp "="] 1
+        }
+    }
+    row rr2b {
+        choice deny display "medium" tcl {
+
+            #if "deny" is "disabled" then remote access is permitted
+            array set opts {
+                disabled "Allow"
+                enabled "Deny"
+            }
+            set crnt [tmsh::run_proc nist80053_1:my_item -dfl "disabled" \
+                /auth remote-role role-info rmt-role-2 deny]
+            return [tmsh::run_proc nist80053_1:array2apl $crnt opts]
+        }
+        editchoice role display "xlarge" tcl {
+
+            tmsh::run_proc nist80053_1:fill_roles opts
+            set crnt [tmsh::run_proc nist80053_1:my_item \
+                /auth remote-role role-info rmt-role-2 role]
+            if {[lsearch -exact [list "" "900" "none"] $crnt] >= 0} {
+                set crnt "no-access"
+            }
+            return [tmsh::run_proc nist80053_1:array2apl $crnt opts]
+        }
+    }
+    row rr2c {
+        editchoice term display "medium" tcl {
+
+            array set opts {
+                disabled "Disabled"
+                tmsh "TMSH"
+            }
+            set crnt [tmsh::run_proc nist80053_1:my_item \
+                -dfl "disabled" \
+                /auth remote-role role-info rmt-role-2 console]
+            return [tmsh::run_proc nist80053_1:array2apl $crnt opts]
+        }
+        editchoice partn display "xlarge" tcl {
+
+            set crnt [tmsh::run_proc nist80053_1:my_item \
+                -dfl "Common" \
+                /auth remote-role role-info rmt-role-2 user-partition]
+            set tmp [tmsh::run_proc nist80053_1:list_partitions $crnt true]
+            return [join $tmp "\n"]
+        }
+    }
+    choice rr3 tcl { return "No\nYes" }
+   }
+
+   optional (rr3 == "Yes") {
+    row rr3a {
+        string attrib display "medium" default tcl {
+
+            set tmp [tmsh::run_proc nist80053_1:my_item \
+                /auth remote-role role-info rmt-role-3 attribute]
+            lindex [split $tmp "="] 0
+        }
+        string val display "xlarge" default tcl {
+
+            set tmp [tmsh::run_proc nist80053_1:my_item \
+                /auth remote-role role-info rmt-role-3 attribute]
+            lindex [split $tmp "="] 1
+        }
+    }
+    row rr3b {
+        choice deny display "medium" tcl {
+
+            #if "deny" is "disabled" then remote access is permitted
+            array set opts {
+                disabled "Allow"
+                enabled "Deny"
+            }
+            set crnt [tmsh::run_proc nist80053_1:my_item -dfl "disabled" \
+                /auth remote-role role-info rmt-role-3 deny]
+            return [tmsh::run_proc nist80053_1:array2apl $crnt opts]
+        }
+        editchoice role display "xlarge" tcl {
+
+            tmsh::run_proc nist80053_1:fill_roles opts
+            set crnt [tmsh::run_proc nist80053_1:my_item \
+                /auth remote-role role-info rmt-role-3 role]
+            if {[lsearch -exact [list "" "900" "none"] $crnt] >= 0} {
+                set crnt "no-access"
+            }
+            return [tmsh::run_proc nist80053_1:array2apl $crnt opts]
+        }
+    }
+    row rr3c {
+        editchoice term display "medium" tcl {
+
+            array set opts {
+                disabled "Disabled"
+                tmsh "TMSH"
+            }
+            set crnt [tmsh::run_proc nist80053_1:my_item \
+                -dfl "disabled" \
+                /auth remote-role role-info rmt-role-3 console]
+            return [tmsh::run_proc nist80053_1:array2apl $crnt opts]
+        }
+        editchoice partn display "xlarge" tcl {
+
+            set crnt [tmsh::run_proc nist80053_1:my_item \
+                -dfl "Common" \
+                /auth remote-role role-info rmt-role-3 user-partition]
+            set tmp [tmsh::run_proc nist80053_1:list_partitions $crnt true]
+            return [join $tmp "\n"]
+        }
+    }
+    choice rr4 tcl { return "No\nYes" }
+   }
+
+   optional (rr4 == "Yes") {
+    row rr4a {
+        string attrib display "medium" default tcl {
+
+            set tmp [tmsh::run_proc nist80053_1:my_item \
+                /auth remote-role role-info rmt-role-4 attribute]
+            lindex [split $tmp "="] 0
+        }
+        string val display "xlarge" default tcl {
+
+            set tmp [tmsh::run_proc nist80053_1:my_item \
+                /auth remote-role role-info rmt-role-4 attribute]
+            lindex [split $tmp "="] 1
+        }
+    }
+    row rr4b {
+        choice deny display "medium" tcl {
+
+            #if "deny" is "disabled" then remote access is permitted
+            array set opts {
+                disabled "Allow"
+                enabled "Deny"
+            }
+            set crnt [tmsh::run_proc nist80053_1:my_item -dfl "disabled" \
+                /auth remote-role role-info rmt-role-4 deny]
+            return [tmsh::run_proc nist80053_1:array2apl $crnt opts]
+        }
+        editchoice role display "xlarge" tcl {
+
+            tmsh::run_proc nist80053_1:fill_roles opts
+            set crnt [tmsh::run_proc nist80053_1:my_item \
+                /auth remote-role role-info rmt-role-4 role]
+            if {[lsearch -exact [list "" "900" "none"] $crnt] >= 0} {
+                set crnt "no-access"
+            }
+            return [tmsh::run_proc nist80053_1:array2apl $crnt opts]
+        }
+    }
+    row rr4c {
+        editchoice term display "medium" tcl {
+
+            array set opts {
+                disabled "Disabled"
+                tmsh "TMSH"
+            }
+            set crnt [tmsh::run_proc nist80053_1:my_item \
+                -dfl "disabled" \
+                /auth remote-role role-info rmt-role-4 console]
+            return [tmsh::run_proc nist80053_1:array2apl $crnt opts]
+        }
+        editchoice partn display "xlarge" tcl {
+
+            set crnt [tmsh::run_proc nist80053_1:my_item \
+                -dfl "Common" \
+                /auth remote-role role-info rmt-role-4 user-partition]
+            set tmp [tmsh::run_proc nist80053_1:list_partitions $crnt true]
+            return [join $tmp "\n"]
+        }
+    }
+    choice rr5 tcl { return "No\nYes" }
+   }
+
+   optional (rr5 == "Yes") {
+    row rr5a {
+        string attrib display "medium" default tcl {
+
+            set tmp [tmsh::run_proc nist80053_1:my_item \
+                /auth remote-role role-info rmt-role-5 attribute]
+            lindex [split $tmp "="] 0
+        }
+        string val display "xlarge" default tcl {
+
+            set tmp [tmsh::run_proc nist80053_1:my_item \
+                /auth remote-role role-info rmt-role-5 attribute]
+            lindex [split $tmp "="] 1
+        }
+    }
+    row rr5b {
+        choice deny display "medium" tcl {
+
+            #if "deny" is "disabled" then remote access is permitted
+            array set opts {
+                disabled "Allow"
+                enabled "Deny"
+            }
+            set crnt [tmsh::run_proc nist80053_1:my_item -dfl "disabled" \
+                /auth remote-role role-info rmt-role-5 deny]
+            return [tmsh::run_proc nist80053_1:array2apl $crnt opts]
+        }
+        editchoice role display "xlarge" tcl {
+
+            tmsh::run_proc nist80053_1:fill_roles opts
+            set crnt [tmsh::run_proc nist80053_1:my_item \
+                /auth remote-role role-info rmt-role-5 role]
+            if {[lsearch -exact [list "" "900" "none"] $crnt] >= 0} {
+                set crnt "no-access"
+            }
+            return [tmsh::run_proc nist80053_1:array2apl $crnt opts]
+        }
+    }
+    row rr5c {
+        editchoice term display "medium" tcl {
+
+            array set opts {
+                disabled "Disabled"
+                tmsh "TMSH"
+            }
+            set crnt [tmsh::run_proc nist80053_1:my_item \
+                -dfl "disabled" \
+                /auth remote-role role-info rmt-role-5 console]
+            return [tmsh::run_proc nist80053_1:array2apl $crnt opts]
+        }
+        editchoice partn display "xlarge" tcl {
+
+            set crnt [tmsh::run_proc nist80053_1:my_item \
+                -dfl "Common" \
+                /auth remote-role role-info rmt-role-5 user-partition]
+            set tmp [tmsh::run_proc nist80053_1:list_partitions $crnt true]
+            return [join $tmp "\n"]
+        }
+    }
+   }
+  }
+ }
+}
+
+section ia5 {
+    message purpose "Set local policy for password valid life, strength, and reuse.  This policy governs local accounts (such as 'admin') but not accounts in an external user authentication/directory server."
+    choice use_pw_policy display "xxlarge" tcl {
+
+        array set opts {
+            enabled "Yes, enforce a custom local password policy"
+            disabled "No, use the BIG-IP default password policy"
+        }
+        set crnt [tmsh::run_proc nist80053_1:my_item -dfl "disabled" \
+            /auth password-policy policy-enforcement]
+        return [tmsh::run_proc nist80053_1:array2apl $crnt opts]
+    }
+    optional (intro.help == "show") {
+        message use_pw_policy_help "Select whether or not you want to enforce a custom local password policy.  If you choose to enforce a custom policy, you configure the policy options in the following questions."
+    }
+    optional (use_pw_policy == "enabled") {
+        row pw_exp {
+            string max_life required display "medium"
+                validator "nonnegativenumber" default tcl {
+
+                    tmsh::run_proc nist80053_1:my_item \
+                        /auth password-policy max-duration
+                }
+            string memory required display "small"
+                validator "nonnegativenumber" default tcl {
+
+                    tmsh::run_proc nist80053_1:my_item \
+                        /auth password-policy password-memory
+                }
+        }
+        optional (intro.help == "show") {
+            message pw_exp_help "Type a number of days before the password should expire.  Next, type the number of password changes required before a previously used password can be reused."
+        }
+        row pw_req {
+          string len required display "small"
+            validator "nonnegativenumber" default tcl {
+
+                tmsh::run_proc nist80053_1:my_item \
+                    /auth password-policy minimum-length
+            }
+          string lower required display "small"
+            validator "nonnegativenumber" default tcl {
+
+                tmsh::run_proc nist80053_1:my_item \
+                    /auth password-policy required-lowercase
+            }
+          string upper required display "small"
+            validator "nonnegativenumber" default tcl {
+
+                tmsh::run_proc nist80053_1:my_item \
+                    /auth password-policy required-uppercase
+            }
+          string special required display "small"
+            validator "nonnegativenumber" default tcl {
+
+                tmsh::run_proc nist80053_1:my_item \
+                    /auth password-policy required-special
+            }
+          string numeric required display "small"
+            validator "nonnegativenumber" default tcl {
+
+                tmsh::run_proc nist80053_1:my_item \
+                    /auth password-policy required-numeric
+            }
+        }
+        optional (intro.help == "show") {
+            message pw_req_help "Specify the minimum number of characters that should be required for each of the options."
+        }
+        message notice "The minimum length requirement does not apply to BIG-IP user accounts with the Administrator role (including built-in accounts 'admin' and 'root')."
+    }
+}
+
+section ac8 {
+    message purpose "Configure login banner messages.  Note:  The message length can exceed the visible width of the entry field."
+    string banner_gui display "xxlarge" default tcl {
+
+        set tmp [tmsh::run_proc nist80053_1:my_item -none \
+                    /sys global-settings gui-security-banner-text]
+        return [regsub {^[\x22\x27](.*)[\x22\x27]$} $tmp {`\1`}]
+    }
+    optional (intro.help == "show") {
+        message banner_gui_help "When a user logs in to the web-based Configuration utility a message is displayed.  You may configure that message here."
+    }
+    string banner_shell display "xxlarge" default tcl {
+
+        set tmp [tmsh::run_proc nist80053_1:my_item -none \
+                    /sys sshd banner-text]
+        return [regsub {^[\x22\x27](.*)[\x22\x27]$} $tmp {`\1`}]
+    }
+    optional (intro.help == "show") {
+        message banner_shell_help "When a user logs in to the BIG-IP command line using SSH or the system console (serial or virtual) a message is displayed.  You may configure that message here."
+    }
+}
+
+optional (intro.sterile == "Show") {
+ section ac9 {
+    message purpose "Configure display of date and time of the last successful login for each user."
+    message info "This data is available to users logging in at the BIG-IP command line (TMSH or Advanced Shell) but not currently available in the BIG-IP web-based Configuration utility (management web GUI)."
+ }
+}
+
+section ac7 {
+    message purpose "Limit failed login attempts (to discourage password-guessing attacks)."
+    choice max_failed_enforce display "xxlarge" tcl {
+
+        array set opts {
+            yes "Yes, limit failed login attempts"
+            no "No, allow unlimited login attempts (not recommended)"
+        }
+        set tmp [tmsh::run_proc nist80053_1:my_item \
+            /auth password-policy max-login-failures]
+        set crnt [expr {($tmp == 0) ? "no" : "yes"}]
+        return [tmsh::run_proc nist80053_1:array2apl $crnt opts]
+    }
+    optional (intro.help == "show") {
+        message max_failed_enforce_help "Choose whether you want to disable the account after multiple failed login attempts, or if you want to allow an unlimited number of login attempts.  For stronger security, we do not recommend allowing unlimited login attempts."
+    }
+    optional (max_failed_enforce == "yes") {
+        string max_failed_attempts required
+            validator "nonnegativenumber" default tcl {
+
+                set tmp [tmsh::run_proc nist80053_1:my_item \
+                    /auth password-policy max-login-failures]
+                return [expr {($tmp == 0) ? 9 : $tmp}]
+            }
+        optional (intro.help == "show") {
+            message max_failed_attempts_help "Type the number of failed login attempts in a row you want to allow before the system disables the account."
+        }
+    }
+}
+
+section sc10 {
+    message purpose "Configure idle timeouts for management access facilities. For each facility the value zero selects a 12-hour timeout."
+    row mins {
+        string timeout_gui required display "small"
+            validator "nonnegativenumber" default tcl {
+
+                set tmp [tmsh::run_proc nist80053_1:my_item \
+                    /sys httpd auth-pam-idle-timeout]
+                return [expr {int(($tmp + 59) / 60)}]
+            }
+        string timeout_ssh required display "small"
+            validator "nonnegativenumber" default tcl {
+
+                set tmp [tmsh::run_proc nist80053_1:my_item \
+                    /sys sshd inactivity-timeout]
+                return [expr {int(($tmp + 59) / 60)}]
+            }
+        string timeout_console required display "small"
+            validator "nonnegativenumber" default tcl {
+
+                set tmp [tmsh::run_proc nist80053_1:my_item \
+                    /sys global-settings console-inactivity-timeout]
+                return [expr {int(($tmp + 59) / 60)}]
+            }
+        string timeout_tmsh required display "small"
+            validator "nonnegativenumber" default tcl {
+
+                set tmp [tmsh::run_proc nist80053_1:my_item \
+                    /cli global-settings idle-timeout]
+                return [expr {($tmp eq "disabled") ? 0 : $tmp}]
+            }
+    }
+    optional (intro.help == "show") {
+        message mins_help "For each field, type the number of minutes of idle time that should elapse before the session times out. Using a value of zero (0) sets the timeout to 12 hours (720 minutes)."
+    }
+}
+
+section ac10 {
+    message purpose "Limit concurrent management GUI sessions (does not restrict command-line (console/SSH) access)."
+    string gui_max_clients required
+        validator "nonnegativenumber" default tcl {
+
+            tmsh::run_proc nist80053_1:my_item /sys httpd max-clients
+        }
+    optional (intro.help == "show") {
+        message gui_max_clients_help "Type the number of concurrent sessions to the web-based Configuration utility (GUI) you want to allow. This setting does not restrict command line access, only the GUI."
+    }
+}
+
+optional (intro.sterile == "Show") {
+ section ac11 {
+    message purpose "Configure screen-lock or session-suspension feature."
+    message info "The BIG-IP system supports timeout of idle sessions but not locking/suspending a session.  To compensate, enable screen-lock/suspension on each management user's client device."
+ }
+}
+
+section sc7a {
+    message purpose "Specify allowed source-IP addresses for management (web) GUI and SSH access."
+    choice mgr_ip_filter display "xxlarge" {
+        "Allow access from any IP address (default)" => "any"  ,
+        "Allow access only from IP addresses I specify" => "restrict"
+    }
+    optional (intro.help == "show") {
+        message mgr_ip_filter_help "Choose how you want the system to control access to the web-based Configuration utility (GUI) and access by SSH. If possible, we recommend allowing access only from the source IP addresses or subnets used by administrators' workstations (or their VPN tunnels)."
+    }
+    optional (mgr_ip_filter == "restrict") {
+        string mgr_ip_allow display "xxlarge" default tcl {
+
+            set tmp [tmsh::run_proc nist80053_1:my_item /sys httpd allow]
+            if {($tmp eq "none") || ($tmp eq "All")} { set tmp "all" }
+            return $tmp
+        }
+        optional (intro.help == "show") {
+            message mgr_ip_allow_help "Type the IP addresses or subnets that should be allowed Configuration utility (GUI) or SSH access.  You can type a list of IP addresses like '203.0.113.5' or subnets as prefix/mask-length like '203.0.113.0/24'.  To enable BIG-IP administrators using the command line of one BIG-IP device in a Device Group to access other BIG-IP devices in that group, add the management-port addresses or subnets of all devices in the group to the allowed list.  Note:  leaving the allowed list empty will allow access from any IP address.  If you really want to disable all network-based management access-- which we STRONGLY recommend against-- list only the loopback subnet 127.0.0.0/8 (doing so will force you to manage this device through the serial or virtual console!)."
+        }
+    }
+}
+
+section sc7b {
+    message purpose "Specify allowed source-IP addresses for SNMP access.  Note that unless you select 'Forbid all SNMP access' the loopback subnet will be allowed so management tools running on the BIG-IP will work."
+    choice snmp_ip_filter display "xxlarge" {
+        "Allow SNMP access only locally from this device (default)" => "self"  ,
+        "Allow SNMP access from IP addresses I specify" => "restrict"  ,
+        "Forbid all SNMP access" => "none"
+    }
+    optional (intro.help == "show") {
+            message snmp_ip_filter_help "Choose the source addresses from which the SNMP service on this device may be accessed.  You can select to:  allow only local access so that commands on this device can access SNMP services on this device via the loopback subnet (this is the system default); allow access only from IP addresses or networks you specify; or forbid all SNMP access from any source address."
+        }
+    optional (snmp_ip_filter == "restrict") {
+        string snmp_ip_allow display "xxlarge" default tcl {
+
+            set tmp [tmsh::run_proc nist80053_1:my_item \
+                /sys snmp allowed-addresses]
+            if {($tmp eq "127") || ($tmp eq "127.0")} {
+                set tmp "127.0.0.0/8"
+            }
+            return $tmp
+        }
+        optional (intro.help == "show") {
+            message help "Type a list of IP addresses, such as '203.0.113.5' or subnets as prefix/mask-length, such as '203.0.113.0/24'."
+        }
+    }
+}
+
+section ac4 {
+    message purpose "Configure services accessible on BIG-IP self IP addresses."
+    optional ("hide" == "always") {
+        string have_selfips default tcl {
+
+            return [tmsh::run_proc f5.iapp.1.5.2.scli:iapp_get_items -nocomplain -list /net self]
+        }
+        string v12plus default tcl {
+
+            return [expr {[tmsh::run_proc f5.iapp.1.5.2.scli:iapp_tmos_version >= 12.0] ? "true" : "false"}]
+        }
+    } 
+    optional (have_selfips == "") {
+        message warn "You have not (yet) created any self IP objects on this BIG-IP device.  If you use this iApp to change the self IP access policy now, that will adjust the 'default' self IP access policy but when you create a new self IP object in the BIG-IP management GUI you will still have to select 'Port Lockdown: Allow Default' to use your policy. (In TMSH you would add 'allow-service default' to your 'create /net self' command.)"
+    }
+    choice self_svc_type display "xxlarge" {
+        "Do not change my current self IP access policy" => "No Changes"  ,
+        "Use the standard BIG-IP list (see SOL17333)" => "Standard"  ,
+        "Prevent access to any services on self IP addresses" => "None"  ,
+        "Let me configure a custom set of services" => "Custom"
+    }
+    optional (intro.help == "show") {
+        message help "You may choose to permit access to some services (such as BIG-IP GTM, DNS, OSPF, HTTPS, etc.) on BIG-IP self IP addresses.  Select 'Do not change...' to leave in place any choices you made outside this iApp template.  In most environments the Standard list (described in f5 Solution Note SOL17333) is appropriate.  Select 'Let me configure a custom set of services' to choose among a set of standard services and/or custom services.  Finally, select 'Prevent access to services on self IP addresses' to permit NO access to services on self IP addresses (this is the same as the initial setting on a new BIG-IP device).  When you click the 'Finished' button at the bottom of this iApp template, your new policy choices (if you made any) will be applied to all of the existing self IP objects and also saved as the new 'default' list for use with self IP objects created in the future.  "
+    }
+    optional (self_svc_type == "Custom" || self_svc_type == "Standard") {
+    message selfip_warn "After completing this iApp template, when (if) you manually create new Self IP addresses on the BIG-IP system outside this iApp template and you want to use your default policy (either the standard BIG-IP list of services or the custom list you will create), you must configure the 'Port Lockdown' setting to 'Allow Default' if using the web-based Configuration utility, or add 'allow-service default' to the TMSH command 'create /net self' command. "
+    }
+    optional (self_svc_type == "Custom") {
+        optional (v12plus == "true") {
+            multichoice v12_svcs
+                default {
+                    "igmp:any"  ,
+                    "ospf:any"  ,
+                    "pim:any"  ,
+                    "tcp:domain"  ,
+                    "tcp:f5-iquery"  ,
+                    "tcp:https"  ,
+                    "tcp:snmp"  ,
+                    "tcp:ssh"  ,
+                    "udp:520"  ,
+                    "udp:cap"  ,
+                    "udp:domain"  ,
+                    "udp:f5-iquery"  ,
+                    "udp:snmp"
+                } {
+                    "igmp:any"  ,
+                    "ospf:any"  ,
+                    "pim:any"  ,
+                    "tcp:domain"  ,
+                    "tcp:f5-iquery"  ,
+                    "tcp:https"  ,
+                    "tcp:snmp"  ,
+                    "tcp:ssh"  ,
+                    "udp:520"  ,
+                    "udp:cap"  ,
+                    "udp:domain"  ,
+                    "udp:f5-iquery"  ,
+                    "udp:snmp"
+                }
+        }
+        optional (v12plus != "true") {
+            multichoice v11_svcs
+                default {
+                    "igmp:any"  ,
+                    "ospf:any"  ,
+                    "pim:any"  ,
+                    "tcp:domain"  ,
+                    "tcp:f5-iquery"  ,
+                    "tcp:https"  ,
+                    "tcp:snmp"  ,
+                    "tcp:ssh"  ,
+                    "udp:520"  ,
+                    "udp:cap"  ,
+                    "udp:domain"  ,
+                    "udp:f5-iquery"  ,
+                    "udp:snmp"
+                } {
+                    "igmp:any"  ,
+                    "ospf:any"  ,
+                    "pim:any"  ,
+                    "tcp:domain"  ,
+                    "tcp:f5-iquery"  ,
+                    "tcp:https"  ,
+                    "tcp:snmp"  ,
+                    "tcp:ssh"  ,
+                    "udp:520"  ,
+                    "udp:cap"  ,
+                    "udp:domain"  ,
+                    "udp:f5-iquery"  ,
+                    "udp:snmp"
+                }
+        }
+        optional (intro.help == "show") {
+            message vNN_svcs_help "Choose the standard services you want to allow.  By default, all of the Standard services are in the 'Selected' list.  Use the remove arrow button to move services from the Selected list to the 'Options' list. Services in the Options list are not allowed. Note that BIG-IP GTM will not work properly unless 'tcp:f5-iquery' is permitted."
+        }
+        table svcs_cust {
+            choice proto display "medium" default "tcp" {"tcp"  , "udp"}
+            string port display "medium" validator "portnumber"
+        }
+        optional (intro.help == "show") {
+            message svcs_cust_help "If you have non-standard services you want to allow, first select the IP protocol, and then type the port number.  Click the Add button to include more non-standard services."
+        }
+    }
+}
+
+section au8 {
+    message purpose "Configure NTP (Network Time Protocol) so log-message timestamps, credential validity checks, and so-forth are accurate and consistent."
+
+    string ntp_pri display "xxlarge" validator "iporfqdn"
+        default tcl {
+
+            lindex [tmsh::run_proc nist80053_1:my_item -none /sys ntp servers] 0
+        }
+        optional (intro.help == "show") {
+            message ntp_help "Type the IP or fully-qualified domain name of the primary NTP server."
+        }
+    message ntp_alt_help "If the Primary NTP Server field is empty, you have not yet configured any NTP servers on this BIG-IP system.  If your network supports multiple NTP servers, enter the IP addresses or fully-qualified domain names of two of them in the primary and first alternate NTP server fields.  After you enter the first alternate NTP server IP or fully-qualified domain name, hit TAB or click another field.  This iApp will then allow you to specify additional NTP servers."
+    string ntp_alt display "xxlarge" validator "iporfqdn"
+        default tcl {
+
+            lindex [tmsh::run_proc nist80053_1:my_item -none /sys ntp servers] 1
+        }
+        optional (intro.help == "show") {
+            message ntp_first_alt_help "Type the IP address or fully-qualified domain name of the first alternate NTP server you want to include in this implementation. Once you press the Tab key or click in any other field, an additional question appears asking if you want to include more servers."
+        }
+    optional (ntp_alt != "") {
+        table ntp_more {
+            string host display "xxlarge" validator "iporfqdn"
+        }
+        optional (intro.help == "show") {
+            message ntp_more_help "Type the IP address or fully-qualified domain name of each additional NTP server."
+        }
+    }
+}
+
+section au2 {
+    message purpose "Configure audit logging of management actions. TMSH audit logs include changes made from the TMSH command line. MCP audit logs include changes made through any interface (management GUI, TMSH, iControl, SNMP)."
+    choice audit_tmsh display "xxlarge" tcl {
+
+        array set opts {
+            disabled "No, disable TMSH audit logs"
+            enabled "Yes, enable TMSH audit logs (recommended)"
+        }
+        set crnt [tmsh::run_proc nist80053_1:my_item -dfl "disabled" \
+            /cli global-settings audit]
+        return [tmsh::run_proc nist80053_1:array2apl $crnt opts]
+    }
+    optional (intro.help == "show") {
+        message audit_tmsh_help "Choose whether or not you want to enable TMSH audit logs.  TMSH audit logging is an optional, recommended feature that logs messages whenever a BIG-IP system TMSH command is issued. The BIG-IP system logs the messages for these auditing events via syslog and in the file /var/log/ltm."
+    }
+    choice audit_mcp display "xxlarge" tcl {
+
+        array set opts {
+            disabled "No, disable MCP audit logs"
+            enabled "Yes, enable level-1 basic MCP audit logs (recommended)"
+            verbose "Yes, enable level-2 verbose MCP audit logs"
+            all "Yes, enable level-3 all/debug MCP audit logs (rarely needed)"
+        }
+        if {[tmsh::run_proc f5.iapp.1.5.2.scli:iapp_tmos_version >= 11.5.3]} {
+          set crnt [tmsh::run_proc nist80053_1:my_item \
+              /sys daemon-log-settings mcpd audit]
+        } else {
+          set tmp [tmsh::run_proc nist80053_1:my_item \
+              /sys db config.auditing value]
+          set rpl [list "enable" "enabled" "disable" "disabled"]
+          set crnt [string map $rpl $tmp]
+        }
+        return [tmsh::run_proc nist80053_1:array2apl $crnt opts]
+    }
+    optional (intro.help == "show") {
+        message audit_mcp_help "Choose whether or not to enable MCP audit logs.  MCP audit logging, similar to TMSH logging, is an optional, recommended feature that logs messages whenever a BIG-IP system object, such as a virtual server or a load balancing pool, is configured (that is, created, modified, or deleted) using any interface, including TMSH, management GUI, iControl, or SNMP. The BIG-IP system logs the messages for these auditing events via syslog and in the file /var/log/ltm.  Level 1 logs user-initiated configuration changes, level 2 logs user-initiated changes and configuration loads, level 3 logs all user- and system-initiated configuration changes."
+    }
+}
+
+ section au9 {
+    message purpose "Specify remote servers to receive syslog messages.  Syslog servers configured outside this iApp will remain active 'in parallel' with any configured here."
+    choice isodate display "xxlarge" tcl {
+
+        array set opts {
+            disabled "No, use the obsolete BIG-IP date format"
+            enabled "Yes, log messages should use ISO date format (recommended)"
+        }
+        set crnt [tmsh::run_proc nist80053_1:my_item /sys syslog iso-date]
+        return [tmsh::run_proc nist80053_1:array2apl $crnt opts]
+    }
+    optional (intro.help == "show") {
+        message isodate_help "Choose whether you want log messages to use ISO date format (YYYY-MM-DDThh:mm:ssZ) or use the BIG-IP date format inherited from older TMOS versions which is obsolete and no longer recommended."
+    }
+    choice logsvrs display "xxlarge" {
+        "No, the system uses syslog servers configured outside this iApp" => "No"  ,
+        "Yes, use this iApp to add syslog servers" => "Yes"
+    }
+    optional (intro.help == "show") {
+            message logsvrs_help "Select whether you want to add syslog servers to the configuration using the iApp template, or if the system uses syslog servers configured outside of the iApp. Note that if you add syslog servers using this iApp, that does not replace existing syslog servers, it just adds additional servers."
+        }
+    optional (logsvrs == "Yes") {
+        table syslog {
+            string addr required display "large"
+                validator "iporfqdn"
+            string port required display "small" 
+                validator "portnumber" default "514"
+            string localip required display "medium"
+                validator "ipaddress" default "*"
+        }
+        optional (intro.help == "show") {
+            message help "Type the IP address or fully-qualified domain name, port, and BIG-IP source IP address of each server you want to add. You may set the BIG-IP address (management port or self IP) from which log messages are sent to each syslog server, or leave the value * to let the BIG-IP system choose."
+        }
+    }
+ }
+}
+
+text {
+    hideme "hidden status info"
+    hideme.firstsave "first save date"
+    hideme.in_AM "appliance mode enabled?"
+
+    intro "Welcome to the BIG-IP NIST Special Publication 800-53r4 iApp Template f5.nist_sp800-53.v1.0.0"
+
+    intro.AM_warn "WARNING"
+    intro.welcome "Introduction"
+    intro.help "Do you want to see inline help?"
+    intro.help_help ""
+    intro.sterile "Should the iApp show blocks containing only advice?"
+    intro.sterile_help ""
+    intro.may_revert "Do you want to see the option to revert to pre-iApp configuration?"
+    intro.may_revert_help ""
+    intro.revert_warn "IMPORTANT"
+    intro.revert_dttm "Date and time the configuration was saved"
+    intro.revert_dttm_help ""
+    intro.revert_now "Do you want to revert to the pre-iApp configuration?"
+    intro.revert_now_help ""
+
+    ac6 "User Authentication/Directory Service -- AC-6, IA-2"
+    ac6.purpose ""
+    ac6.user_dir "Which authentication/directory service do you want to use?"
+    ac6.user_dir_help ""
+    ac6.ext_role "What is the default role for users without local accounts?"
+    ac6.ext_console "Should users without local accounts be able access the TMSH console?"
+    ac6.ext_console_help ""
+    ac6.ext_help ""
+
+    ia2 "External Authentication/Directory Server(s) -- IA-2, IA-3"
+
+    ia2.ldap_help ""
+    ia2.l_uid_help ""
+    ia2.l_uid "What is the name of the login attribute?"
+    ia2.l_base_help ""
+    ia2.l_base "What is the DN of the Search Base?"
+    ia2.l_scope_help ""
+    ia2.l_scope "Which Search Scope do you want to use?"
+    ia2.l_dyn_group_help ""
+    ia2.l_dyn_group "Do directory user objects include group-membership attributes (like memberOf)?"
+    ia2.l_bind_dn_help ""
+    ia2.l_bind_dn "What is the DN of the Search Account?"
+    ia2.l_bind_pw1_help ""
+    ia2.l_bind_pw1 "What is the Search Account secret (passphrase)?"
+    ia2.l_bind_pw2 "Confirm the Search Account secret (passphrase)"
+    ia2.l_ssl_help ""
+    ia2.l_ssl "Do you want to secure authentication queries with TLS (SSL)?"
+    ia2.l_ssl_port_help ""
+    ia2.l_ssl_port "Which secure LDAPS port do you want to use?"
+    ia2.l_ca_cert_help ""
+    ia2.l_ca_cert "Which CA certificate is used to validate directory servers?"
+    ia2.l_cert_help ""
+    ia2.l_cert "Which TLS (SSL) client certificate should the BIG-IP use?"
+    ia2.l_key "What is the private key for the BIG-IP's client certificate?"
+    ia2.l_key_help ""
+    ia2.l_nossl_port_help ""
+    ia2.l_nossl_port "Which unsecure LDAP port do you want to use?"
+    ia2.l_svr_pri "What is the IP address or FQDN of the primary directory server?"
+    ia2.l_svr_pri_help ""
+    ia2.l_svr_alt "What is the IP address or FQDN of the first alternate directory server?"
+    ia2.l_svr_alt_help "IMPORTANT"
+    ia2.l_svr_alt_more_help ""
+    ia2.l_svr_more_help ""
+    ia2.l_svr_more "Which additional directory servers do you want to include?"
+    ia2.l_svr_more.host ""
+    ia2.l_debug_help ""
+    ia2.l_debug "Do you want to enable LDAP debugging?"
+
+    ia2.r_help ""
+    ia2.r_p_host_help ""
+    ia2.r_p_host "What is the IP address or FQDN of the primary RADIUS server?"
+    ia2.r_p_secret "What is the primary RADIUS server secret?"
+    ia2.r_p_secret_help ""
+    ia2.r_p_confirm "Confirm the RADIUS secret"
+    ia2.r_p_port_help ""
+    ia2.r_p_port "Which port does the primary RADIUS server use?"
+    ia2.r_s_host_help "NOTE"
+    ia2.r_s_host2_help ""
+    ia2.r_s_host "What is the IP address or FQDN of the first alternate RADIUS server?"
+    ia2.r_s_secret_help ""
+    ia2.r_s_secret "What is the first alternate RADIUS server secret?"
+    ia2.r_s_confirm "Confirm the RADIUS secret"
+    ia2.r_s_port "Which port does the alternate RADIUS server use?"
+    ia2.r_s_port_help ""
+    ia2.r_even_more_help ""
+    ia2.r_more_help "IMPORTANT"
+    ia2.r_more "Which additional RADIUS servers do you want to include?"
+    ia2.r_more.host "Server"
+    ia2.r_more.secret "Secret"
+    ia2.r_more.confirm "Confirm"
+    ia2.r_more.port "Port"
+    ia2.r_debug_help ""
+    ia2.r_debug "Do you want to enable RADIUS debugging?"
+
+    ia2.tacacs_help ""
+    ia2.t_service_help ""
+    ia2.t_service "What is the TACACS+ service name?"
+    ia2.t_proto_help ""
+    ia2.t_proto "What is the TACACS+ protocol name?"
+    ia2.t_secret_help ""
+    ia2.t_secret "What is the TACACS+ secret?"
+    ia2.t_confirm "Confirm the TACACS+ secret"
+    ia2.t_enc_help ""
+    ia2.t_enc "Do you want to secure authentication queries with TACACS+ encryption?"
+    ia2.t_auth_help ""
+    ia2.t_auth "How should the system attempt authentication?"
+    ia2.t_acct_help ""
+    ia2.t_acct "Should the system send accounting information to all servers?"
+    ia2.t_svr_pri_help ""
+    ia2.t_svr_pri "What is the IP address or FQDN of the primary TACACS+ server?"
+    ia2.t_svr_alt_help "IMPORTANT"
+    ia2.t_svr_more2_help ""
+    ia2.t_svr_alt "What is the IP address or FQDN of the first alternate TACACS+ server?"
+    ia2.t_svr_more_help ""
+    ia2.t_svr_more "Which additional TACACS+ servers do you want to include?"
+    ia2.t_svr_more.host ""
+    ia2.t_debug_help ""
+    ia2.t_debug "Do you want to enable TACACS+ debugging?"
+
+    ia2.apm_help ""
+    ia2.apm_auth_pfl "Which APM system authentication profile do you want to use?"
+
+    ac3 "Remote Roles -- AC-3(7), CM-5"
+    ac3.purpose ""
+    ac3.help ""
+    ac3.rr1 "Do you want to add remote roles?"
+    ac3.rr1a "What are the settings for remote role 1?"
+    ac3.rr_a_help ""
+    ac3.rr1a.attrib "Directory attribute"
+    ac3.rr1a.val " Value must be"
+    ac3.rr1b ""
+    ac3.rr_b_help ""
+    ac3.rr1b.deny "BIG-IP access"
+    ac3.rr1b.role "BIG-IP role"
+    ac3.rr1c ""
+    ac3.rr_c_help ""
+    ac3.rr1c.term "TMSH access"
+    ac3.rr1c.partn "Partition"
+    ac3.rr2 "Add another role?"
+    ac3.rr2_help ""
+
+    ac3.rr2a "What are the settings for remote role 2"
+    ac3.rr2a.attrib "Directory attribute"
+    ac3.rr2a.val " Value must be"
+    ac3.rr2b ""
+    ac3.rr2b.deny "BIG-IP access"
+    ac3.rr2b.role "BIG-IP role"
+    ac3.rr2c ""
+    ac3.rr2c.term "TMSH access"
+    ac3.rr2c.partn "Partition"
+    ac3.rr3 "Add another role?"
+
+    ac3.rr3a "What are the settings for remote role 3"
+    ac3.rr3a.attrib "Directory attribute"
+    ac3.rr3a.val " Value must be"
+    ac3.rr3b ""
+    ac3.rr3b.deny "BIG-IP access"
+    ac3.rr3b.role "BIG-IP role"
+    ac3.rr3c ""
+    ac3.rr3c.term "TMSH access"
+    ac3.rr3c.partn "Partition"
+    ac3.rr4 "Add another role?"
+
+    ac3.rr4a "What are the settings for remote role 4"
+    ac3.rr4a.attrib "Directory attribute"
+    ac3.rr4a.val " Value must be"
+    ac3.rr4b ""
+    ac3.rr4b.deny "BIG-IP access"
+    ac3.rr4b.role "BIG-IP role"
+    ac3.rr4c ""
+    ac3.rr4c.term "TMSH access"
+    ac3.rr4c.partn "Partition"
+    ac3.rr5 "Add another role?"
+
+    ac3.rr5a "What are the settings for remote role 5"
+    ac3.rr5a.attrib "Directory attribute"
+    ac3.rr5a.val " Value must be"
+    ac3.rr5b ""
+    ac3.rr5b.deny "BIG-IP access"
+    ac3.rr5b.role "BIG-IP role"
+    ac3.rr5c ""
+    ac3.rr5c.term "TMSH access"
+    ac3.rr5c.partn "Partition"
+
+    ia5 "Password Strength Policy -- IA-5(1)"
+    ia5.purpose ""
+    ia5.use_pw_policy "Do you want to enforce custom local password policy?"
+    ia5.use_pw_policy_help ""
+    ia5.pw_exp "How many days should pass before the password expires?"
+    ia5.pw_exp_help ""
+    ia5.pw_exp.max_life ""
+    ia5.pw_exp.memory "How many changes before reuse?"
+    ia5.pw_req "How many characters should be the minimum for each setting?"
+    ia5.pw_req_help ""
+    ia5.pw_req.len "Length"
+    ia5.pw_req.lower "Lowercase"
+    ia5.pw_req.upper "Uppercase"
+    ia5.pw_req.special "Special chars"
+    ia5.pw_req.numeric "Digits"
+    ia5.notice "NOTE"
+
+    ac8 "Usage Banner -- AC-8"
+    ac8.purpose ""
+    ac8.banner_gui "What banner message should appear for the web-based Configuration utility?"
+    ac8.banner_gui_help ""
+    ac8.banner_shell "What banner message should appear for the management console?"
+    ac8.banner_shell_help ""
+
+    ac9 "Display Last Access -- AC-9"
+    ac9.purpose ""
+    ac9.info "Advice"
+
+    ac7 "Maximum Failed Login Attempts -- AC-7"
+    ac7.purpose ""
+    ac7.max_failed_enforce "Disable account after several failed login attempts?"
+    ac7.max_failed_enforce_help ""
+    ac7.max_failed_attempts "Allow how many consecutive login failures before disabling the account?"
+    ac7.max_failed_attempts_help ""
+
+    sc10 "Idle Timeouts for Management Access -- AC-2(5), SC-10"
+    sc10.purpose ""
+    sc10.mins "How many minutes for each Idle Timeout value? "
+    sc10.mins_help ""
+    sc10.mins.timeout_gui "Management GUI"
+    sc10.mins.timeout_ssh "SSH"
+    sc10.mins.timeout_console "Console"
+    sc10.mins.timeout_tmsh "TMSH"
+
+    ac10 "Concurrent Management GUI Access -- AC-10"
+    ac10.purpose ""
+    ac10.gui_max_clients "How many GUI sessions may be active at once?"
+    ac10.gui_max_clients_help ""
+
+    ac11 "Session Locking and Termination -- AC-11, AC-12"
+    ac11.purpose ""
+    ac11.info "Advice"
+
+    sc7a "Management Access IP Addresses -- SC-7"
+    sc7a.purpose ""
+    sc7a.mgr_ip_filter "How should the system control BIG-IP management access?"
+    sc7a.mgr_ip_filter_help ""
+    sc7a.mgr_ip_allow "Which IP addresses should be allowed?"
+    sc7a.mgr_ip_allow_help ""
+
+    sc7b "SNMP access IP Addresses -- SC-7"
+    sc7b.purpose ""
+    sc7b.snmp_ip_filter "How should the system control SNMP access?"
+    sc7b.snmp_ip_filter_help ""
+    sc7b.snmp_ip_allow "Which IP addresses should be allowed?"
+    sc7b.help ""
+
+    ac4 "Self IP Lockdown -- AC-4, SC-7"
+    ac4.purpose ""
+    ac4.warn "WARNING"
+    ac4.selfip_warn "WARNING"
+    ac4.self_svc_type "What type of self IP access policy do you want to use?"
+    ac4.v12_svcs "Which standard services to you want to allow?"
+    ac4.v11_svcs "Which standard services to you want to allow?"
+    ac4.vNN_svcs_help ""
+    ac4.svcs_cust "Which other (non-standard) services do you want to allow?"
+    ac4.svcs_cust_help ""
+    ac4.svcs_cust.proto "IP protocol"
+    ac4.svcs_cust.port "Port"
+    ac4.help ""
+
+    au8 "NTP Configuration -- AU-8(1,2)"
+    au8.purpose ""
+    au8.ntp_help ""
+    au8.ntp_pri "What is the IP address or FQDN of the primary NTP server?"
+    au8.ntp_alt_help "IMPORTANT"
+    au8.ntp_first_alt_help ""
+    au8.ntp_alt "What is the IP address or FQDN of the first alternate NTP server?"
+    au8.ntp_more_help ""
+    au8.ntp_more "What are the IP addresses or FQDNs of the additional NTP server(s)?"
+    au8.ntp_more.host ""
+
+    au2 "Auditing -- AU-2, CM-5"
+    au2.purpose ""
+    au2.audit_tmsh "Do you want to enable TMSH audit logs?"
+    au2.audit_tmsh_help ""
+    au2.audit_mcp "Do you want to enable MCP audit logs?"
+    au2.audit_mcp_help ""
+
+    au9 "Syslog Configuration -- AU-8, AU-9(2), AU-12(2)"
+    au9.purpose ""
+    au9.isodate "Should log messages use ISO date format?"
+    au9.isodate_help ""
+    au9.logsvrs "Do you want to add syslog servers?"
+    au9.logsvrs_help ""
+    au9.syslog "Which syslog servers do you want to add?"
+    au9.syslog.addr "Server"
+    au9.syslog.port "Port"
+    au9.syslog.localip "BIG-IP source IP"
+    au9.help ""
+}
+            }
+            role-acl { admin }
+            run-as none
+        }
+    }
+    description "Configure BIG-IP management plane for NIST SP-800-53r4"
+    ignore-verification false
+    requires-bigip-version-max none
+    requires-bigip-version-min 11.5.3
+    requires-modules none
+    signing-key none
+    tmpl-checksum none
+    tmpl-signature kjmfP9XldVQ/YK+mt8f4jX8ypaoxkw+FPIFswz8Nfvntzr3yBAyPB5dFBjmyF62pkZULXQYB4T6cjhLk1CE35kgWwdUp0VaNCPKpy7MPR7pPl0in9nB/CZm3qpoaKciW34sLuD7vUVLMv0haxbjNeRPtWIQZs4AlNn6RIoYOskX9ae/aidSscM7fNbPFbrEAxzWts61amdtIhPwkVe5N6D+NRmTdT0Jnr6NKo33KETNvmxu6V25UdVHXMAMPrg7j/E1g+fkSPGjHtyfaGXi9N+HXUZ/D3pJhxNCNvxBhnd3G5DOBMemUz1BZnVwSJRkqvT4cOTQsaZQAupp+tHR6QQ==
+}
+############################################################
+# Signing Server:
+# 
+# Sys::Version
+# Main Package
+#   Product     BIG-IP
+#   Version     12.0.0
+#   Build       0.0.606
+#   Edition     Final
+#   Date        Fri Aug 21 13:29:22 PDT 2015
+# 
+############################################################
